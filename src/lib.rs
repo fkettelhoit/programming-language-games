@@ -284,12 +284,12 @@ fn simplify(v: Val) -> Val {
 }
 
 impl Val {
-    fn depth(&self) -> usize {
+    fn rank(&self) -> usize {
         match self {
             Val::String(_) | Val::Lambda(_, _, _) => 0,
             Val::TimeLoop(vals) => {
                 vals.iter()
-                    .map(|(k, _v)| k.depth())
+                    .map(|(k, _v)| k.rank())
                     .max()
                     .unwrap_or_default()
                     + 1
@@ -343,22 +343,22 @@ fn eq(a: Val, b: Val) -> Result<Val, String> {
             Rc::new(Env::Nil),
         )
     }
-    let depth_a = a.depth();
-    let depth_b = b.depth();
+    let rank_a = a.rank();
+    let rank_b = b.rank();
     match (a, b) {
         (Val::String(a), Val::String(b)) if a == b => Ok(_true()),
         (Val::String(_), Val::String(_)) => Ok(_false()),
         (a @ Val::Lambda(_, _, _), b) | (a, b @ Val::Lambda(_, _, _)) => {
             Err(format!("Cannot compare {a} with {b}"))
         }
-        (a, Val::TimeLoop(b)) if depth_a < depth_b => {
+        (a, Val::TimeLoop(b)) if rank_a < rank_b => {
             let mut compared = BTreeMap::new();
             for (k, v) in b {
                 compared.insert(k.clone(), eq(a.clone(), v)?);
             }
             Ok(Val::time_loop(compared))
         }
-        (Val::TimeLoop(a), b) if depth_a > depth_b => {
+        (Val::TimeLoop(a), b) if rank_a > rank_b => {
             let mut compared = BTreeMap::new();
             for (k, v) in a {
                 compared.insert(k.clone(), eq(v, b.clone())?);
@@ -381,13 +381,13 @@ fn eq(a: Val, b: Val) -> Result<Val, String> {
 }
 
 fn app(f: Val, arg: Val) -> Result<Val, String> {
-    let depth_f = f.depth();
-    let depth_arg = arg.depth();
+    let rank_f = f.rank();
+    let rank_arg = arg.rank();
     match f {
         Val::String(s) => Err(format!("Cannot apply the string {s} to the argument {arg}")),
         Val::Lambda(param, body, env) => body.eval(&env.set(param, arg)),
         Val::TimeLoop(f) => match arg {
-            Val::TimeLoop(mut arg) if depth_f == depth_arg => {
+            Val::TimeLoop(mut arg) if rank_f == rank_arg => {
                 let mut zipped = BTreeMap::new();
                 for (k, f) in f.into_iter() {
                     if let Some(arg) = arg.remove(&k) {
@@ -396,7 +396,7 @@ fn app(f: Val, arg: Val) -> Result<Val, String> {
                 }
                 Ok(Val::time_loop(zipped))
             }
-            Val::TimeLoop(arg) if depth_f < depth_arg => {
+            Val::TimeLoop(arg) if rank_f < rank_arg => {
                 let mut mapped = BTreeMap::new();
                 for (k, arg) in arg {
                     mapped.insert(k, app(Val::TimeLoop(f.clone()), arg)?);
