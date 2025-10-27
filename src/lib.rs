@@ -16,11 +16,8 @@ enum Tok<'code> {
     LBracket,
     RBracket,
     Colon,
-    Semicolon,
     Comma,
     DoubleEq,
-    At,
-    Slash,
     Ampersand,
 }
 
@@ -36,11 +33,8 @@ impl std::fmt::Display for Tok<'_> {
             Tok::LBracket => f.write_str("["),
             Tok::RBracket => f.write_str("]"),
             Tok::Colon => f.write_str(":"),
-            Tok::Semicolon => f.write_str(";"),
             Tok::Comma => f.write_str(","),
             Tok::DoubleEq => f.write_str("=="),
-            Tok::At => f.write_str("@"),
-            Tok::Slash => f.write_str("/"),
             Tok::Ampersand => f.write_str("&"),
         }?;
         f.write_str("'")
@@ -58,10 +52,7 @@ fn scan(code: &str) -> Vec<(Tok, usize)> {
             '[' => Some(Tok::LBracket),
             ']' => Some(Tok::RBracket),
             ':' => Some(Tok::Colon),
-            ';' => Some(Tok::Semicolon),
             ',' => Some(Tok::Comma),
-            '@' => Some(Tok::At),
-            '/' => Some(Tok::Slash),
             _ => None,
         };
         let is_comment = c == '#';
@@ -197,11 +188,8 @@ fn parse(code: &str) -> Result<Expr, String> {
             | Tok::LBracket
             | Tok::RBracket
             | Tok::Colon
-            | Tok::Semicolon
             | Tok::Comma
             | Tok::DoubleEq
-            | Tok::At
-            | Tok::Slash
             | Tok::Ampersand
             | Tok::Num(_)
             | Tok::Keyword(_) => Err((format!("Expected an expression, found {tok}"), Some(i))),
@@ -249,7 +237,7 @@ enum Val {
 }
 
 impl Val {
-    fn tl(l: BTreeMap<Val, Val>) -> Val {
+    fn time_loop(l: BTreeMap<Val, Val>) -> Val {
         simplify(Val::TimeLoop(l))
     }
 }
@@ -368,14 +356,14 @@ fn eq(a: Val, b: Val) -> Result<Val, String> {
             for (k, v) in b {
                 compared.insert(k.clone(), eq(a.clone(), v)?);
             }
-            Ok(Val::tl(compared))
+            Ok(Val::time_loop(compared))
         }
         (Val::TimeLoop(a), b) if depth_a > depth_b => {
             let mut compared = BTreeMap::new();
             for (k, v) in a {
                 compared.insert(k.clone(), eq(v, b.clone())?);
             }
-            Ok(Val::tl(compared))
+            Ok(Val::time_loop(compared))
         }
         (Val::TimeLoop(mut a), Val::TimeLoop(mut b)) => {
             a = normalize(a);
@@ -386,7 +374,7 @@ fn eq(a: Val, b: Val) -> Result<Val, String> {
                     compared.insert(k, eq(a, b)?);
                 }
             }
-            Ok(Val::tl(compared))
+            Ok(Val::time_loop(compared))
         }
         (Val::String(_), Val::TimeLoop(_)) | (Val::TimeLoop(_), Val::String(_)) => unreachable!(),
     }
@@ -406,21 +394,21 @@ fn app(f: Val, arg: Val) -> Result<Val, String> {
                         zipped.insert(k, app(f, arg)?);
                     }
                 }
-                Ok(Val::tl(zipped))
+                Ok(Val::time_loop(zipped))
             }
             Val::TimeLoop(arg) if depth_f < depth_arg => {
                 let mut mapped = BTreeMap::new();
                 for (k, arg) in arg {
                     mapped.insert(k, app(Val::TimeLoop(f.clone()), arg)?);
                 }
-                Ok(Val::tl(mapped))
+                Ok(Val::time_loop(mapped))
             }
             arg => {
                 let mut mapped = BTreeMap::new();
                 for (k, f) in f {
                     mapped.insert(k, app(f, arg.clone())?);
                 }
-                Ok(Val::tl(mapped))
+                Ok(Val::time_loop(mapped))
             }
         },
     }
@@ -443,7 +431,7 @@ impl Expr {
                     let v = v.eval(env)?;
                     evaled.insert(k, v);
                 }
-                Ok(Val::tl(evaled))
+                Ok(Val::time_loop(evaled))
             }
             Expr::Lambda(v, body) => Ok(Val::Lambda(v, body, Rc::clone(env))),
             Expr::App(f, arg) => {
@@ -458,7 +446,7 @@ impl Expr {
 pub fn eval(code: &str) -> Result<String, String> {
     let expr = parse(code)?;
     let val = match expr.eval(&Rc::new(Env::Nil))? {
-        Val::TimeLoop(l) => Val::tl(normalize(l)),
+        Val::TimeLoop(l) => Val::time_loop(normalize(l)),
         v => v,
     };
     Ok(format!("{val}"))
