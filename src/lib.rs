@@ -259,21 +259,38 @@ fn is_loop(l: &BTreeMap<Val, Val>) -> bool {
 }
 
 fn normalize(l: BTreeMap<Val, Val>) -> BTreeMap<Val, Val> {
-    // TODO: normalize recursively
-    if is_loop(&l) {
-        l.into_iter().map(|(k, _)| (k.clone(), k)).collect()
+    let mut normalized = BTreeMap::new();
+    for (mut k, mut v) in l.into_iter() {
+        if let Val::TimeLoop(l) = k {
+            k = Val::TimeLoop(normalize(l));
+        }
+        if let Val::TimeLoop(l) = v {
+            v = Val::TimeLoop(normalize(l));
+        }
+        normalized.insert(k, v);
+    }
+    if is_loop(&normalized) {
+        normalized
+            .into_iter()
+            .map(|(k, _)| (k.clone(), k))
+            .collect()
     } else {
-        l
+        normalized
     }
 }
 
 fn simplify(v: Val) -> Val {
-    // TODO: simplify recursively
     match v {
-        Val::TimeLoop(l) => match l.values().collect::<HashSet<_>>().len() {
-            1 => l.into_iter().map(|(_, v)| v).next().unwrap(),
-            _ => Val::TimeLoop(l),
-        },
+        Val::TimeLoop(l) => {
+            let l: BTreeMap<_, _> = l
+                .into_iter()
+                .map(|(k, v)| (simplify(k), simplify(v)))
+                .collect();
+            match l.values().collect::<HashSet<_>>().len() {
+                1 => l.into_iter().map(|(_, v)| v).next().unwrap(),
+                _ => Val::TimeLoop(l),
+            }
+        }
         _ => v,
     }
 }
