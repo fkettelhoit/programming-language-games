@@ -13,8 +13,6 @@ enum Tok<'code> {
     Keyword(&'code str),
     LParen,
     RParen,
-    LBracket,
-    RBracket,
     Colon,
     Comma,
     DoubleEq,
@@ -30,8 +28,6 @@ impl std::fmt::Display for Tok<'_> {
             Tok::String(s) => write!(f, "'{s}'"),
             Tok::LParen => f.write_str("("),
             Tok::RParen => f.write_str(")"),
-            Tok::LBracket => f.write_str("["),
-            Tok::RBracket => f.write_str("]"),
             Tok::Colon => f.write_str(":"),
             Tok::Comma => f.write_str(","),
             Tok::DoubleEq => f.write_str("=="),
@@ -49,8 +45,6 @@ fn scan(code: &str) -> Vec<(Tok, usize)> {
         let tok = match c {
             '(' => Some(Tok::LParen),
             ')' => Some(Tok::RParen),
-            '[' => Some(Tok::LBracket),
-            ']' => Some(Tok::RBracket),
             ':' => Some(Tok::Colon),
             ',' => Some(Tok::Comma),
             _ => None,
@@ -185,8 +179,6 @@ fn parse(code: &str) -> Result<Expr, String> {
                 }
             }
             Tok::RParen
-            | Tok::LBracket
-            | Tok::RBracket
             | Tok::Colon
             | Tok::Comma
             | Tok::DoubleEq
