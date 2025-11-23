@@ -1,4 +1,4 @@
-# Time loop calculus
+# Terminator - a calculus for time loops
 
 A minimal language / calculus for exploring paradoxical fixed points.
 
