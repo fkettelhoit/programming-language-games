@@ -37,7 +37,7 @@ impl std::fmt::Display for Tok<'_> {
     }
 }
 
-fn scan(code: &str) -> Vec<(Tok, usize)> {
+fn scan(code: &str) -> Vec<(Tok<'_>, usize)> {
     let mut toks = vec![];
     let mut i = 0;
     let mut chars = code.char_indices().chain(iter::once((code.len(), ' ')));
@@ -513,13 +513,9 @@ mod tests {
         let v = "('x' & ('x' & 'y'))";
         let code = format!(
             "
-        if {v} == ('x' & 'y'): # (('x' & 'y'): 'x', 'x': ('x': 'x', 'y': false))
+        if {v} == ('x' & 'y'):
             'x'
         else:
-            # (
-            #   ('x': 'y') &
-            #   (('x' & 'y'): ('x' & 'y'))
-            # )
             if {v} == 'x':
                 'y'
             else:
