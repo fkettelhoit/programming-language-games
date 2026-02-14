@@ -1,0 +1,31 @@
+add = (x, y) { x + y }
+
+match_pair = (x) {
+    match (x) [
+        Foo(Bar, Baz) -> { "just Foo(Bar, Baz)" }
+        Foo(x, x) -> { twice(x) }
+        Foo(x, ^y) -> { "second element is y" }
+        _ -> { throw!("Expected a Foo(...)!") }
+    ]
+}
+
+side_effect()
+
+do_something = () {
+    input = read!()
+    match (input) [
+        Ok(contents) -> { contents }
+        _ -> { throw!("Couldn't read any input!") }
+    ]
+}
+
+try {
+    foo()
+    bar()
+    baz()
+    qux()
+    foo()
+    bar()
+    baz()
+    qux()
+} catch: read! as: (resume, arg) => { resume("test input") }
