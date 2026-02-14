@@ -122,6 +122,7 @@ impl<'c> Parser<'c> {
                 _ => return Ok(Ast::Infix(i, f, [x, y], None)),
             },
             Ast::Prefix(i, f, args) => (i, f, Some(args)),
+            Ast::String(i, s) => (i, Box::new(Ast::String(i, s)), None),
             Ast::Var(i, v) => (i, Box::new(Ast::Var(i, v)), None),
             expr => return Ok(expr),
         };
@@ -337,11 +338,12 @@ fn is_kw_list(ast: &Ast) -> bool {
             s.chars().next().map_or(false, |c| c.is_ascii_lowercase())))))
 }
 
-const MAX_ONE_LINE_COMPLEXITY: usize = 8;
+const MAX_ONE_LINE_COMPLEXITY: usize = 10;
 
 impl Ast<'_> {
     fn size(&self) -> usize {
         match self {
+            Ast::String(_, s) if s.split_whitespace().skip(1).next().is_some() => 4,
             Ast::Var(_, _) | Ast::String(_, _) => 1,
             Ast::List(_, xs) | Ast::Tuple(_, xs) | Ast::Block(_, xs) => {
                 xs.iter().map(|x| x.size()).sum::<usize>() + 1
@@ -381,11 +383,7 @@ impl Ast<'_> {
         }
         fn wrap(open: char, close: char, xs: &[Ast], lvl: usize, size: usize) -> String {
             if size < MAX_ONE_LINE_COMPLEXITY {
-                if open == '{' {
-                    format!("{open} {} {close}", one_line(xs, lvl + 1))
-                } else {
-                    format!("{open}{}{close}", one_line(xs, lvl + 1))
-                }
+                format!("{open}{}{close}", one_line(xs, lvl + 1))
             } else {
                 format!("{open}{}{close}", multi_line(xs, lvl + 1))
             }
@@ -403,7 +401,7 @@ impl Ast<'_> {
                 }
                 wrap('(', ')', xs, lvl, self.size())
             }
-            Ast::Block(_, xs) => wrap('{', '}', xs, lvl, self.size()),
+            Ast::Block(_, xs) => format!("{{{}}}", multi_line(xs, lvl + 1)),
             Ast::Prefix(_, f, xs) => {
                 let (args, kw) = if xs.last().map_or(false, is_kw_list) {
                     (&xs[..xs.len() - 1], Some(xs.last().unwrap()))
@@ -421,7 +419,8 @@ impl Ast<'_> {
                 } else {
                     multi_line(call_args, lvl + 1)
                 };
-                let mut result = if call_args.is_empty() && !trailing_args.is_empty() {
+                let has_trailing_args = !trailing_args.is_empty() || kw.is_some();
+                let mut result = if call_args.is_empty() && has_trailing_args {
                     f.pretty_lvl(lvl)
                 } else if trailing_args.is_empty() {
                     format!("{}({args})", f.pretty_lvl(lvl))

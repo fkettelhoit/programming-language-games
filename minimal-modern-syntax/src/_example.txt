@@ -1,11 +1,21 @@
-add = (x, y) { x + y }
+add = (x, y) {
+    x + y
+}
 
 match_pair = (x) {
     match (x) [
-        Foo(Bar, Baz) -> { "just Foo(Bar, Baz)" }
-        Foo(x, x) -> { twice(x) }
-        Foo(x, ^y) -> { "second element is y" }
-        _ -> { throw!("Expected a Foo(...)!") }
+        Pair("apple", "apple") -> {
+            "a pair of apples"
+        }
+        Pair(x, x) -> {
+            "a pair of the same things"
+        }
+        Pair(x, ^y) -> {
+            "second element is y"
+        }
+        _ -> {
+            throw!("Expected a pair")
+        }
     ]
 }
 
@@ -14,18 +24,37 @@ side_effect()
 do_something = () {
     input = read!()
     match (input) [
-        Ok(contents) -> { contents }
-        _ -> { throw!("Couldn't read any input!") }
+        Ok(contents) -> {
+            contents
+        }
+        _ -> {
+            throw!("Couldn't read any input!")
+        }
     ]
 }
 
 try {
-    foo()
-    bar()
-    baz()
-    qux()
-    foo()
-    bar()
-    baz()
-    qux()
-} catch: read! as: (resume, arg) => { resume("test input") }
+    something_that_might_read()
+} catch: read! as: (resume, arg) => {
+    resume("test input")
+}
+
+some_data = [
+    Html lang: "en" stylesheet: "styles/style.css" title: "Page Title" sections: [
+        Note date: ["2025", "06", "12"]
+        Section title: "Section 1" blocks: [
+            ["This is a paragraph with ", Emph("emphasis")]
+            List [
+                [
+                    "An item with a "
+                    Link("link") href: "http://www.example.com"
+                ]
+            ]
+            Subsection title: "Subsection Title" blocks: [
+                ["Another paragraph."]
+                ["Another paragraph."]
+            ]
+        ]
+        Section title: "Section 2" id: "sec2" blocks: [["Not much here."]]
+    ]
+]

@@ -1,6 +1,6 @@
 # Time loop maps - programming with paradoxical loop values
 
-A minimal language / calculus for exploring paradoxical fixed points, which are values that are _both_ `X` _and not_ `X` at the same time, so that paradoxes can be “solved”. Think of it like solving time travel paradoxes by going back in time _and_ not going back in time, at the same time.
+A minimal language / calculus for exploring paradoxical fixed points, which are values that are both X and not X, so that paradoxes can be solved. Think of it like solving time travel paradoxes by going back in time and not going back in time, at the same time.
 
 ## Motivation
 
