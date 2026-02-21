@@ -1,0 +1,37 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><link rel="stylesheet" href="../styles/style.css" /><title>RC week 11: reasonable macros through explicit bindings, part 2</title></head><body><p><a href="..#notes">Notes</a><br />2025/08/05</p><h1>RC week 11: reasonable macros through explicit bindings, part 2</h1><p>Building on <a href="../papers/reasonable-macros-through-explicit-bindings.pdf">last week's paper</a> and a discussion at the programming languages group at the <a href="https://www.recurse.com/">Recurse Center</a>, here's a slightly different syntax for reasonable macros.</p><h2>Explicit bindings</h2><p>The basic idea is the same: If we want language "constructs" such as <code>=</code> to be normal functions, we need to distinguish variables that are being <em>bound</em> from variables that are being <em>used.</em></p><pre><code>x = y // x is being bound, y is being used
+</code></pre><p>Since variables are used more often than they are being bound, it seems natural to use special syntax for binding variables:</p><pre><code>:x = y // x is being bound, y is being used
+</code></pre><p>In terms of scope, <code>:x</code> is being bound in the <em>enclosing scope:</em> If we delimit variable scopes using <code>{...}</code>, we can think of <code>:x</code> as being bound in the enclosing <code>{...}</code>, so that any later occurrence of <code>x</code> in the block gets its value from the binding:</p><pre><code>{
+    f(x) // x gets its value from the parent scope
+    :x = y
+    f(x) // x gets its value from `:x = y`
+}
+</code></pre><p>The top-level <code>{...}</code> is implicit. Using explicit bindings, a pattern matching construct could look as follows:</p><pre><code>:a = &quot;foo&quot;
+:b = Pair(&quot;foo&quot;, &quot;bar&quot;)
+match (b) [
+    Pair(:x, :x) -&gt; { &quot;the same&quot; }
+    Pair(a, :y) -&gt; { &quot;first has value a&quot; }
+    Pair(:x, :y) -&gt; { &quot;different&quot; }
+]
+</code></pre><h2>Multi-level bindings</h2><p>But frequently, variables need to be bound in several different scopes at once. The classic example is recursive functions: The name of a recursive function needs to be bound both in the definition of the function (so that it can be called recursively) and in the enclosing scope (so that the function can be used). In contrast, the parameters of a recursive function are only bound in the definition of the function, since it wouldn't make sense to refer to the parameters of a function after the function definition ends.</p><p>One way to make this difference syntactically explicit is to use the syntax <code>:x</code> for a variable that is bound (only) in the next scope, while <code>::x</code> is used for a variable that is bound in the next two scopes (which can also include the enclosing scope). A recursive function could then be defined as follows:</p><pre><code>::foo(:x, :y) = {
+    foo(f(x), f(y)) // foo is called recursively
+}
+foo(1, 2) // foo is used
+</code></pre><p>This is the solution presented in the above paper. It works, but isn't very pretty.</p><h2>Distinguishing scopes</h2><p>An alternative would be to use different syntax for binding something in the <em>enclosing scope</em> compared to <em>inner scopes.</em> For binding something in the enclosing scope, we can continue to use <code>:x</code>, but as soon as a function (which could be an infix function such as <code>=</code>) has a block argument of the form <code>{...}</code>, we assume that a variable <code>x</code> is a <em>binding</em> and that a variable that is being <em>used</em> must be prefixed with an explicit "pin" as <code>^x</code>:</p><pre><code>:foo(x, y) = {
+    foo(f(x), f(y)) // foo is called recursively
+}
+foo(1, 2) // foo is used
+</code></pre><p>The pattern matching construct from above would look as follows:</p><pre><code>:a = &quot;foo&quot;
+:b = Pair(&quot;foo&quot;, &quot;bar&quot;)
+match (b) [
+    Pair(x, x) -&gt; { &quot;the same&quot; }
+    Pair(^a, y) -&gt; { &quot;first has value a&quot; }
+    Pair(x, y) -&gt; { &quot;different&quot; }
+]
+</code></pre><p>This would be compatible with the macro system described in the paper (and it would still be possible to desugar macros without requiring macro expansion), while also being much closer to how variable scopes work in most other languages. (The <code>^</code> notation is also what Elixir uses to <a href="https://hexdocs.pm/elixir/main/patterns-and-guards.html#variables">resolve variables in patterns</a>.)</p><h2>Resolving macros</h2><p>There's also the question of how functions are distinguished from macros. Function arguments are passed as regular values, but macro arguments are annotated in such a way that their syntactic structure is exposed. The solution presented in the paper is to use different syntax when macros/functions are <em>defined</em> so that the environment keeps track of which symbols are functions and which are macros.</p><pre><code>:f = ... // regular function/variable
+#f = ... // macro
+</code></pre><p>Another option would be to decide whether a function is a macro based on how it's being <em>used,</em> based on the following logic: A function is a macro if it is called with <code>{...}</code> blocks as arguments or if it is used inside of an enclosing <code>{...}</code> block and one of its arguments contains an explicit binding:</p><pre><code>f(x, y)       // regular function
+f(:x)         // macro with explicit binding argument
+f(x, { ... }) // macro with block argument
+f(g({ ... })) // f is a function, g is a macro
+f(g(:x))      // f is a macro, g is not called
+</code></pre><p>These changes (distinguishing enclosing scopes from inner scopes, resolving macros based on how functions are called) preserve the essential aspects of reasonable macros, but lead to syntax that is much closer to existing languages.</p><footer>Want to become a better programmer? <a href="https://www.recurse.com/scout/click?t=764048f99cede394c1905c64e1545a5d">Join the Recurse Center!</a></footer></body></html>

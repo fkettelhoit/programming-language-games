@@ -1,0 +1,117 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><link rel="stylesheet" href="../styles/style.css" /><title>Implicit vs. explicit macro bindings for recursive definitions</title></head><body><p><a href="..#notes">Notes</a><br />2026/01/30</p><h1>Implicit vs. explicit macro bindings for recursive definitions</h1><p>One of Kombucha's defining features is that no functions and no constructs are syntactically privileged, even core constructs such as assignment and pattern matching are implemented as user-defined functions, using a lightweight macro system. However, in contrast to languages like Lisp, Kombucha's macro system is entirely <em>syntactical</em>, meaning that no macros need to be evaluated to know where bindings come into scope.</p><p>What that means in practice is that you can tell which names are <em>values</em> and which names are <em>bindings</em> just by looking at the source code, without having to execute any macros (in your head or by the compiler). A Python-style assignment such as <code>x = y</code> looks innocent enough, but the left hand side name <code>x</code> is a binding, whereas the right hand side name <code>y</code> is a value that is looked up in the environment. Kombucha distinguishes these concepts syntactically.</p><h2>Two types of macro scopes</h2><p>In Kombucha, macros always bind their bindings in the nearest scope, which is a block wrapped in <code>{ ... }</code>. There are two types of macro scopes, an enclosing scope and an argument scope:</p><pre><code>// enclosing scope, where `{ ... }` surrounds the macro `=`:
+{
+    // bind `x` in the _enclosing_ scope:
+    $x = &quot;hello&quot;
+
+    // we can now use `x` here:
+    foo(x)
+}
+
+// argument scope, where `{ ... }` follows the macro `=&gt;` as an argument:
+match(value, [
+    // bind `x` in the argument scope `{ ... }`, but _resolve_ `y`
+    ($x, y) =&gt; {
+        // `x` is bound here
+        &quot;a pair with the value of y as its second element&quot;
+    }
+    // bind `x` and `y` in the argument scope `{ ... }`
+    ($x, $y) =&gt; {
+        // `x` and `y` are bound here
+        &quot;it&apos;s a pair!&quot;
+    }
+])
+</code></pre><p>In the above examples, I used <code>$</code> as a prefix to mark bindings (which will be bound in the scope) and distinguish them from variables (which are resolved in the current scope).</p><p>But there's another possibility: We could treat all names in certain contexts as bindings and require all variables in these contexts to be explicitly annotated using Ruby/Elixir-style <code>^x</code> ”pin” syntax. Our bindings-by-default context will be the left hand side of any infix expression that...</p><ul><li>appears as an element in an enclosing <code>{ ... }</code> scope,</li><li>or has a <code>{ ... }</code> scope as its right hand side argument.</li></ul><p>Our above example could then be rewritten as follows:</p><pre><code>// enclosing scope, where `{ ... }` surrounds the macro `=`:
+{
+    // bind `x` in the _enclosing_ scope:
+    x = &quot;hello&quot;
+
+    // we can now use `x` here:
+    foo(x)
+}
+
+// argument scope, where `{ ... }` follows the macro `=&gt;` as an argument:
+match(value, [
+    // bind `x` in the argument scope `{ ... }`, but _resolve_ `y`
+    (x, ^y) =&gt; {
+        // `x` is bound here
+        &quot;a pair with the value of y as its second element&quot;
+    }
+    // bind `x` and `y` in the argument scope `{ ... }`
+    (x, y) =&gt; {
+        // `x` and `y` are bound here
+        &quot;it&apos;s a pair!&quot;
+    }
+])
+</code></pre><p>This is a lot cleaner and also closer to other languages, at the expense of requiring some awareness of when left hand sides of infix functions are treated as macro contexts. But the rule is simple enough to learn that this seems acceptable.</p><h2>Combining enclosing scope and argument scope</h2><p>The real problem comes up when trying to combine enclosing and argument scopes, for example in the case of building a macro that supports recursive function definitions: A definition such as <code>f(x, y) = { ... }</code> needs to bind <code>f</code> (and <em>only</em> <code>f</code>) in the enclosing scope, but it also needs to bind <code>f</code> (recursively), <code>x</code>, and <code>y</code> (as arguments) in the function body <code>{ ... }</code> How can we distinguish <code>f</code> (which needs to be bound twice) from <code>x</code> and <code>y</code> (which should not be bound in the enclosing scope)? With the explicit <code>$</code> syntax, this is possible (but far from pretty):</p><pre><code>{
+    $$f($x, $y) = {
+        // `f`, `x`, and `y` are bound here
+    }
+
+    // only `f` is bound here, because it was &quot;double-bound&quot; using $$
+    f(&quot;hello&quot;, &quot;world&quot;)
+}
+</code></pre><p>How can we combine enclosing and argument scopes without explicit <code>$</code>? Using <code>^</code> to mark <code>x</code> and <code>y</code> as being “less bound” than <code>f</code> feels strange, because we do not resolve <code>x</code> and <code>y</code> in the outer scope at any point:</p><pre><code>{
+    f(^x, ^y) = {
+        // `f`, `x`, and `y` are bound here
+    }
+
+    // only `f` is bound here, because `^x` and `^y` went out of scope
+    f(&quot;hello&quot;, &quot;world&quot;)
+}
+</code></pre><p>Another option is disallowing a combination of enclosing-scope and argument-scope macros altogether. Functions could then only be defined as a combination of assignment and lambdas:</p><pre><code>{
+    // non-recursive function definition:
+    f = ((x, y) =&gt; {
+        // `f`, `x`, and `y` are bound here
+    })
+
+    // recursive function definition:
+    g = (g ~&gt; {
+        // `g` is (recursively) bound here
+        (x, y) =&gt; {
+            // `g`, `x`, and `y` are bound here
+        }
+    })
+
+    // only `f` and `g` are bound here
+    f(&quot;hello&quot;, &quot;world&quot;)
+    g(&quot;hello&quot;, &quot;world&quot;)
+}
+</code></pre><p>This simplifies the implementation (and the mental model of macros), but ends up looking pretty verbose, especially in a language like Kombucha that requires explicit disambiguation of nested infix functions using <code>( ... )</code>.</p><p>One last option is to bind <em>all</em> names twice whenever a macro appears both in an enclosing scope <em>and</em> has a <code>{ ... }</code> argument. The function name would then still need to be split from the arguments, but at least it wouldn't need to be repeated:</p><pre><code>{
+    // recursive function definition:
+    g = {
+        (x, y) =&gt; {
+            // `g`, `x`, and `y` are bound here
+        }
+    }
+
+    // only `g` is bound here
+    g(&quot;hello&quot;, &quot;world&quot;)
+}
+</code></pre><p>One variation on that last option is to treat all enclosing scope macros as binding their names both in the enclosing scope and in their right hand side argument (thus implicitly wrapping their right hand side in <code>{ ... }</code>). This gives us the cleanest syntax for recursive function definitions, but has the drawback that all assignment is implicitly recursive:</p><pre><code>{
+    // recursive function definition:
+    g = ((x, y) =&gt; {
+        // `g`, `x`, and `y` are bound here
+    })
+
+    // only `g` is bound here
+    g(&quot;hello&quot;, &quot;world&quot;)
+
+    // this works fine:
+    x = &quot;hello&quot;
+
+    // but this would bind `x` recursively, instead of shadowing it:
+    x = [x]
+}
+</code></pre><p>Summing up, here are the options:</p><ul><li>Make the “double-bound” <code>f</code> in <code>f(x, y)</code> explicit using <code>$</code>. But then why not make all enclosing scope bindings explicit using <code>$</code>? This is explicit and simple, but verbose, because every assignment looks like <code>$x = y</code>.</li><li>Make the ”single-bound” <code>x</code> and <code>y</code> in <code>f(x, y)</code> explicit, ideally using a symbol other than <code>^</code> (because <code>x</code> and <code>y</code> aren't really resolved). This requires annotating every single function argument, like <code>f(^x, ^y, ^z)</code>, which is verbose.</li><li>Disallow combining enclosing scopes and argument scopes, so that every name is bound at most once. This is simple and explicit, but requires writing out the function name twice: <code>f = (f ~> { (x, y) => { ... } })</code></li><li>Bind <em>all</em> names <em>twice</em> whenever an enclosing scope is <em>combined</em> with an argument scope. This still requires splitting function names from arguments, but gets rid of repetition.</li><li>Bind <em>all</em> names <em>twice</em> for <em>every</em> enclosing scope macro. This is the cleanest option in terms of syntax, but also feels like the most magical and makes shadowing variables awkward / impossible.</li></ul><h2>Better syntax for combining infix functions</h2><p>Lastly, any of the three options that involve splitting the function name from its arguments using an infix function raises the question of how infix functions can be combined without always requiring <code>( ... )</code> for disambiguation.</p><p>One option would be to use newlines as precedence markers, so that <code>=></code> binds more tightly than <code>=</code> in the following example:</p><pre><code>{
+    f =
+        (x, y) =&gt; {
+
+        }
+}
+</code></pre><p>Another option would be to allow trailing arguments for infix functions. (This would be compatible with keyword arguments for prefix functions, because trailing <code>{ ... }</code> arguments can only appear <em>before</em> keyword arguments, which makes it unambiguous that the trailing <code>{ ... }</code> after an infix call must belong to the infix function.)</p><pre><code>{
+    // { ... } is a trailing argument here:
+    f = (x, y) {
+        // `f`, `x`, and `y` are bound here
+    }
+}
+</code></pre><p>Is there a clear winner here? Not really. Implicit double binding, no shadowing, and trailing arguments for infix functions seem like a promising combination, but also feel like there's a lot of magic involved and are more complex than I'd like. It might be a good approach to try, let's see how it works in practice.</p><footer>Want to become a better programmer? <a href="https://www.recurse.com/scout/click?t=764048f99cede394c1905c64e1545a5d">Join the Recurse Center!</a></footer></body></html>
