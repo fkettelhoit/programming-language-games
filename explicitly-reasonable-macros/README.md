@@ -1,6 +1,6 @@
 # Explicitly reasonable macros — pattern matching as a library
 
-Can a language allow everything to be redefined (including variable assignment and pattern matching) while keeping the scope of variables immediately obvious, without evaluating any function or macro?
+Can a language allow everything to be redefined (even variable assignment and pattern matching) while keeping the scope of variables immediately obvious, without evaluating any macros?
 
 This experiment implements a minimal language where pattern matching with unification is defined entirely as a library (without any built-in support for matching) by making variable bindings syntactically explicit. The `$` prefix distinguishes variables that are being _bound_ from variables that are being _used_, and `{ ... }` blocks delimit where bindings are in scope. These two syntactic markers are enough for the language to automatically preserve the structure of expressions containing bindings, so that a user-defined `match` function can inspect patterns, extract bindings, and perform unification at runtime (all while variable scopes remain statically obvious).
 
