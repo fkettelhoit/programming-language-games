@@ -81,11 +81,7 @@ match(Pair(Foo, Bar), [
     Pair($x, $y) => { Pair(y, x) }
 ])
 // result: Pair(Bar, Foo)
-```
 
-Unification — requiring repeated bindings to match equal values — works naturally:
-
-```
 match(Pair(Foo, Foo), [Pair($x, $x) => { x }])
 // result: Foo
 
@@ -121,7 +117,7 @@ match(Left(Foo), [
 // result: GotLeft(Foo)
 ```
 
-The full pattern matching implementation is roughly 40 lines and is loaded as a prelude — it uses only the built-in functions listed above and defines `match` as a recursive function that walks the annotated pattern tree.
+The full pattern matching implementation is roughly 40 lines and is loaded as a prelude.
 
 ## Related work
 
