@@ -648,8 +648,60 @@ pub fn desugar_program(exprs: &[Ast<'_>]) -> Core {
     desugar_block(exprs)
 }
 
+// --- Validation ---
+//
+// Reject infix expressions with a block RHS (and no trailing block) as
+// direct elements of a block.  E.g. `{ f = { body } }` is rejected
+// because it is not yet decided whether `f` should be double-bound
+// (available both inside the block and in the enclosing scope).  Use a
+// trailing block instead: `{ f = () { body } }`.
+//
+// Even the no-bindings case (e.g. `{ True => { Yes }, rest }`) is
+// rejected: it has no legitimate use as a block element and reserving
+// the syntax keeps our options open.
+
+fn validate_block_elems(elems: &[Ast<'_>], code: &str) -> Result<(), String> {
+    for elem in elems {
+        if let Ast::Infix(pos, _, [_, rhs], None) = elem {
+            if matches!(rhs.as_ref(), Ast::Block(..)) {
+                return Err(format!(
+                    "infix with block body as a block element is not yet supported \
+                     (at {}); use trailing block syntax instead, \
+                     e.g. `name = (args) {{ body }}`",
+                    pos.line_in(code)
+                ));
+            }
+        }
+        validate(elem, code)?;
+    }
+    Ok(())
+}
+
+fn validate(ast: &Ast<'_>, code: &str) -> Result<(), String> {
+    match ast {
+        Ast::Block(_, elems) => validate_block_elems(elems, code),
+        Ast::List(_, elems) => elems.iter().try_for_each(|e| validate(e, code)),
+        Ast::Prefix(_, f, args) => {
+            validate(f, code)?;
+            args.iter().try_for_each(|a| validate(a, code))
+        }
+        Ast::Infix(_, _, [x, y], trailing) => {
+            validate(x, code)?;
+            validate(y, code)?;
+            if let Some(t) = trailing {
+                validate(t, code)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 pub fn parse_and_desugar(code: &str) -> Result<Core, String> {
     let ast = parse(code)?;
+    for expr in &ast {
+        validate(expr, code)?;
+    }
     Ok(desugar_program(&ast))
 }
 
@@ -1246,6 +1298,30 @@ mod tests {
             d("True => { Yes }"),
             "=>(True, (_) => Yes)"
         );
+    }
+
+    // -- Validation tests --
+
+    #[test]
+    fn reject_block_rhs_in_block() {
+        assert!(parse_and_desugar("{ f = { x }, y }").is_err());
+        assert!(parse_and_desugar("{ x => { x }, y }").is_err());
+        assert!(parse_and_desugar("{ Pair(a, b) => { a }, y }").is_err());
+        assert!(parse_and_desugar("{ True => { Yes }, y }").is_err());
+    }
+
+    #[test]
+    fn allow_block_rhs_outside_block() {
+        assert!(parse_and_desugar("x => { x }").is_ok());
+        assert!(parse_and_desugar("Pair(x, y) => { x }").is_ok());
+        assert!(parse_and_desugar("[x => { x }]").is_ok());
+        assert!(parse_and_desugar("True => { Yes }").is_ok());
+    }
+
+    #[test]
+    fn allow_trailing_block_in_block() {
+        assert!(parse_and_desugar("{ f = () { x }, y }").is_ok());
+        assert!(parse_and_desugar("{ f = (a, b) { a }, y }").is_ok());
     }
 
     // -- Interpreter tests --
