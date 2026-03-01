@@ -921,6 +921,14 @@ pub struct Program {
 }
 
 #[derive(Debug, Clone)]
+pub struct ContData {
+    ip: usize,
+    env: Vec<Value>,
+    stack: Vec<Value>,
+    frames: Vec<Frame>,
+}
+
+#[derive(Debug, Clone)]
 pub enum Value {
     Int(i64),
     Bool(bool),
@@ -929,7 +937,7 @@ pub enum Value {
     List(Vec<Value>),
     Closure(u8, usize, Vec<Value>),
     RecClosure(u8, usize, Vec<Value>),
-    Continuation(Box<VM>),
+    Continuation(Rc<ContData>),
     Unit,
 }
 
@@ -971,7 +979,7 @@ impl Value {
             Value::Closure(arity, _, _) | Value::RecClosure(arity, _, _) => {
                 format!("<fn/{arity}>")
             }
-            Value::Continuation(_) => "<continuation>".to_string(),
+            Value::Continuation(..) => "<continuation>".to_string(),
         }
     }
 }
@@ -1024,6 +1032,7 @@ struct TryMarker {
     saved_env_len: usize,
     saved_frames_len: usize,
     saved_handler_lens: Vec<usize>,
+    is_resume_delimiter: bool,
 }
 
 #[derive(Debug)]
@@ -1056,29 +1065,6 @@ impl VM {
             try_markers: vec![],
             ip: 0,
         }
-    }
-
-    fn snapshot(&self) -> VM {
-        VM {
-            code: self.code.clone(),
-            strings: self.strings.clone(),
-            effects: self.effects.clone(),
-            stack: self.stack.clone(),
-            env: self.env.clone(),
-            frames: self.frames.clone(),
-            handlers: self.handlers.clone(),
-            try_markers: self.try_markers.clone(),
-            ip: self.ip,
-        }
-    }
-
-    fn restore(&mut self, state: VM) {
-        self.stack = state.stack;
-        self.env = state.env;
-        self.frames = state.frames;
-        self.handlers = state.handlers;
-        self.try_markers = state.try_markers;
-        self.ip = state.ip;
     }
 
     fn run(mut self) -> RunResult {
@@ -1200,14 +1186,49 @@ impl VM {
                             self.env.extend(args);
                             self.ip = addr;
                         }
-                        Value::Continuation(state) => {
+                        Value::Continuation(cont_rc) => {
                             if args.len() != 1 {
                                 return RunResult::Error(
                                     "Continuation expects 1 argument".into(),
                                 );
                             }
                             let val = args.into_iter().next().unwrap();
-                            self.restore(*state);
+                            let cont_data = Rc::try_unwrap(cont_rc)
+                                .unwrap_or_else(|rc| (*rc).clone());
+
+                            // Push a return frame so the result comes back
+                            // to the resume call site when the delimited
+                            // computation finishes (via CleanupTry with
+                            // is_resume_delimiter).
+                            self.frames.push(Frame {
+                                return_ip: self.ip,
+                                saved_env: std::mem::take(&mut self.env),
+                            });
+                            let frames_base = self.frames.len();
+                            let stack_base = self.stack.len();
+
+                            // Move the continuation's delta onto current VM.
+                            self.stack.extend(cont_data.stack);
+                            self.env = cont_data.env;
+                            self.frames.extend(cont_data.frames);
+
+                            // Push a resume-delimiter try marker. When
+                            // CleanupTry pops this, it returns the result
+                            // to the resume caller via Frame above.
+                            self.try_markers.push(TryMarker {
+                                after_addr: 0,
+                                saved_stack_len: stack_base,
+                                saved_env_len: 0,
+                                saved_frames_len: frames_base,
+                                saved_handler_lens: self
+                                    .handlers
+                                    .iter()
+                                    .map(|h| h.len())
+                                    .collect(),
+                                is_resume_delimiter: true,
+                            });
+
+                            self.ip = cont_data.ip;
                             self.stack.push(val);
                         }
                         _ => return RunResult::Error(format!(
@@ -1230,6 +1251,7 @@ impl VM {
                         saved_env_len: self.env.len(),
                         saved_frames_len: self.frames.len(),
                         saved_handler_lens: self.handlers.iter().map(|h| h.len()).collect(),
+                        is_resume_delimiter: false,
                     });
                 }
                 Op::PushHandler(eff_id) => {
@@ -1247,6 +1269,18 @@ impl VM {
                             self.handlers[eff_id].truncate(saved_len);
                         }
                     }
+                    if marker.is_resume_delimiter {
+                        // Delimited computation finished — truncate
+                        // stack/frames to composition base, then return
+                        // the result to the resume() call site.
+                        let result = self.stack.pop().unwrap();
+                        self.stack.truncate(marker.saved_stack_len);
+                        self.frames.truncate(marker.saved_frames_len);
+                        let frame = self.frames.pop().unwrap();
+                        self.env = frame.saved_env;
+                        self.ip = frame.return_ip;
+                        self.stack.push(result);
+                    }
                 }
                 Op::Effect(eff_id, n) => {
                     let n = n as usize;
@@ -1259,16 +1293,33 @@ impl VM {
                     };
 
                     if let Some(entry) = handler {
-                        // ip already points to the instruction after Effect
-                        let snapshot = self.snapshot();
-                        let continuation = Value::Continuation(Box::new(snapshot));
-
                         let marker = self.try_markers[entry.try_depth].clone();
+
+                        // Save the env prefix for the handler's return frame
+                        // (replicates the old truncate-then-take behavior).
+                        let env_base_len = marker.saved_env_len
+                            .min(self.env.len());
+                        let handler_base_env =
+                            self.env[..env_base_len].to_vec();
+
+                        // Capture the delta above the try marker (move, not clone).
+                        let cont_data = ContData {
+                            ip: self.ip,
+                            env: std::mem::take(&mut self.env),
+                            stack: self.stack.split_off(marker.saved_stack_len),
+                            frames: self.frames.split_off(
+                                marker.saved_frames_len,
+                            ),
+                        };
+                        let continuation = Value::Continuation(
+                            Rc::new(cont_data),
+                        );
+
+                        // Rollback: try_markers and handlers to pre-try state.
                         self.try_markers.truncate(entry.try_depth);
-                        self.stack.truncate(marker.saved_stack_len);
-                        self.env.truncate(marker.saved_env_len);
-                        self.frames.truncate(marker.saved_frames_len);
-                        for (i, &saved_len) in marker.saved_handler_lens.iter().enumerate() {
+                        for (i, &saved_len) in
+                            marker.saved_handler_lens.iter().enumerate()
+                        {
                             if i < self.handlers.len() {
                                 self.handlers[i].truncate(saved_len);
                             }
@@ -1290,7 +1341,7 @@ impl VM {
 
                         self.frames.push(Frame {
                             return_ip: marker.after_addr,
-                            saved_env: std::mem::take(&mut self.env),
+                            saved_env: handler_base_env,
                         });
                         self.env = closure_env;
                         self.env.push(continuation);
@@ -1856,6 +1907,49 @@ mod tests {
             }
             VMResult::Done(v) => panic!("Expected effect, got {:?}", v),
         }
+    }
+
+    #[test]
+    fn effect_mutable_state() {
+        let prelude = "
+            run_state = (state, thunk) {
+                try { thunk() } catch: [
+                    get!: (resume) => { run_state(state, { resume(state) }) },
+                    set!: (resume, new_state) => { run_state(new_state, { resume(Unit) }) }
+                ]
+            }
+        ";
+        // Basic: set then get
+        assert_eq!(
+            r(&format!("{prelude}\nrun_state(0, {{ set!(42), get!() }})")),
+            "42"
+        );
+        // Increment twice from 0
+        assert_eq!(
+            r(&format!(
+                "{prelude}\nrun_state(0, {{ set!(get!() + 1), set!(get!() + 1), get!() }})"
+            )),
+            "2"
+        );
+        // Read initial state
+        assert_eq!(
+            r(&format!("{prelude}\nrun_state(99, {{ get!() }})")),
+            "99"
+        );
+        // Factorial via mutable accumulator
+        assert_eq!(
+            r(&format!(
+                "{prelude}
+                factorial = (n) {{
+                    if(n == 0, {{ get!() }}, {{
+                        set!(get!() * n),
+                        factorial(n - 1)
+                    }})
+                }}
+                run_state(1, {{ factorial(20) }})"
+            )),
+            "2432902008176640000"
+        );
     }
 
     // ==========================================
