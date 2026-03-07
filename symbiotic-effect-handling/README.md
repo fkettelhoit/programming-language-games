@@ -1,4 +1,4 @@
-# Symbiotic effect handling — let the host do your math
+# Symbiotic effect handling — Let the host do your math
 
 How can you jump-start a programming language? What if instead of building your own standard library you just “symbiotically” depend on a host even for basic operations like arithmetic?
 

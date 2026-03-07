@@ -1,10 +1,6 @@
-# Reasonable macros — pattern matching as a library
+# Reasonable macros — Pattern matching as a library
 
 Can a language allow everything to be redefined (even variable assignment and pattern matching) while keeping the scope of variables immediately obvious? Without evaluating any macros?
-
-This experiment implements a minimal language where pattern matching with unification is defined entirely as a library (without any built-in support for matching), while respecting a single guiding principle:
-
-_Every construct in the language can be redefined, there are no privileged language constructs. But the scope of variables remains immediately obvious, just by looking at the source code, without evaluating any function or macro._
 
 ## Motivation
 
@@ -13,6 +9,12 @@ Programming languages face a tension between the ability to extend them dynamica
 The problem with macros is that just seeing an expression such as `f(2 + 2)` in the source code does not guarantee that it is equivalent to `f(4)`, because `f` could be a macro and thus treat `2 + 2` differently from `4`. By exposing all of the syntactic structure of a program, macros have to be used sparingly and/or expanded before it is possible to reason about equivalent expressions.
 
 There is an unexplored middle ground, however, of allowing binding constructs to be defined and extended, while ensuring that all variables are lexically bound and that their scope can be determined statically.
+
+## Outcome
+
+This experiment implements a minimal language where pattern matching with unification is defined entirely as a library (without any built-in support for matching), while respecting a single guiding principle:
+
+_Every construct in the language can be redefined, there are no privileged language constructs. But the scope of variables remains immediately obvious, just by looking at the source code, without evaluating any function or macro._
 
 ## Approach
 
@@ -92,11 +94,9 @@ The case `f = { body }` as a direct block element (which combines an enclosing-s
 
 Unlike the explicit variant, where `$` markers could appear anywhere (including in prefix call arguments), implicit bindings only arise in infix expressions. Prefix calls like `if(cond, { then }, { else })` are always regular function calls. Blocks in prefix arguments are thunks, never binding scopes. This is by design: all binding constructs must use infix syntax, which makes binding context unambiguous from the shape of the expression alone.
 
-## Outcome: pattern matching as a library
+## Pattern matching as a library
 
-The experiment implements a working scanner, parser, validation pass, desugarer, and interpreter. The language desugars entirely to a call-by-value lambda calculus with a handful of built-in functions (`=`, `if`, `eq`, `tag`, `fields`, `head`, `tail`, `is_empty`, `cons`, `fix`, `panic`).
-
-**Pattern matching with unification is implemented as a library**, without extending the language or adding any built-in support for matching. The `match` function and the `=>` infix operator are regular user-defined functions that process the annotated syntax tree at runtime:
+Pattern matching with unification is implemented as a library, without extending the language or adding any built-in support for matching. The language desugars entirely to a call-by-value lambda calculus with a handful of built-in functions (`=`, `if`, `eq`, `tag`, `fields`, `head`, `tail`, `is_empty`, `cons`, `fix`, `panic`). In contrast to these built-in functions, pattern matching is user-defined: The `match` function and the `=>` infix operator are regular user-defined functions that process the annotated syntax tree at runtime.
 
 ```
 match(Pair(Foo, Bar), [
