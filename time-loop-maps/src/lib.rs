@@ -17,6 +17,7 @@ enum Tok<'code> {
     Comma,
     DoubleEq,
     Ampersand,
+    FatArrow,
 }
 
 impl std::fmt::Display for Tok<'_> {
@@ -32,6 +33,7 @@ impl std::fmt::Display for Tok<'_> {
             Tok::Comma => f.write_str(","),
             Tok::DoubleEq => f.write_str("=="),
             Tok::Ampersand => f.write_str("&"),
+            Tok::FatArrow => f.write_str("=>"),
         }?;
         f.write_str("'")
     }
@@ -55,6 +57,7 @@ fn scan(code: &str) -> Vec<(Tok<'_>, usize)> {
             if !code[i..j].is_empty() {
                 let tok = match &code[i..j] {
                     "==" => Tok::DoubleEq,
+                    "=>" => Tok::FatArrow,
                     "&" => Tok::Ampersand,
                     kw @ ("if" | "else") => Tok::Keyword(kw),
                     _ => match &code[i..j].parse::<usize>() {
@@ -130,17 +133,34 @@ fn parse(code: &str) -> Result<Expr, String> {
         }
     }
     fn parse_infix(toks: &mut Toks<'_>) -> Result<Expr, (String, Option<usize>)> {
-        let x = parse_arg(toks)?;
+        let x = parse_app(toks)?;
         match toks.peek() {
             Some((Tok::DoubleEq, _)) => {
                 toks.next();
-                let y = parse_arg(toks)?;
+                let y = parse_app(toks)?;
                 Ok(Expr::Eq([Box::new(x), Box::new(y)]))
             }
             _ => Ok(x),
         }
     }
-    fn parse_arg(toks: &mut Toks<'_>) -> Result<Expr, (String, Option<usize>)> {
+    fn parse_app(toks: &mut Toks<'_>) -> Result<Expr, (String, Option<usize>)> {
+        let mut expr = parse_inner(toks)?;
+        while let Some((Tok::LParen, _)) = toks.peek() {
+            toks.next();
+
+            let mut args = vec![parse_expr(toks)?];
+            while let Some((Tok::Comma, _)) = toks.peek() {
+                toks.next();
+                args.push(parse_expr(toks)?);
+            }
+            expect(toks, Tok::RParen)?;
+            for arg in args {
+                expr = Expr::App(expr.into(), arg.into());
+            }
+        }
+        Ok(expr)
+    }
+    fn parse_inner(toks: &mut Toks<'_>) -> Result<Expr, (String, Option<usize>)> {
         let Some((tok, i)) = toks.next() else {
             return Err(("Expected an expression, but found nothing".into(), None));
         };
@@ -148,33 +168,67 @@ fn parse(code: &str) -> Result<Expr, String> {
             Tok::Ident(v) => Ok(Expr::Var(v.into())),
             Tok::String(s) => Ok(Expr::String(s.into())),
             Tok::LParen => {
-                let expr = parse_expr(toks)?;
-                if let Some((Tok::Colon, _)) = toks.peek() {
+                if let Some((Tok::Ident(var), _)) = toks.peek().copied() {
                     toks.next();
-                    let v = parse_expr(toks)?;
-                    let mut exprs = vec![(expr, v)];
+                    let mut vars = vec![var.to_string()];
                     while let Some((Tok::Comma, _)) = toks.peek() {
                         toks.next();
-                        let k = parse_expr(toks)?;
-                        expect(toks, Tok::Colon)?;
-                        let v = parse_expr(toks)?;
-                        exprs.push((k, v))
+                        match toks.next() {
+                            Some((Tok::Ident(var), _)) => vars.push(var.to_string()),
+                            Some((tok, i)) => {
+                                return Err((format!("Expected a variable, found {tok}"), Some(i)));
+                            }
+                            None => {
+                                return Err((
+                                    "Expected a variable, but found nothing".into(),
+                                    None,
+                                ));
+                            }
+                        }
                     }
                     expect(toks, Tok::RParen)?;
-                    Ok(Expr::TimeLoop(exprs))
+                    match toks.peek() {
+                        Some((Tok::FatArrow, _)) => {
+                            toks.next();
+                            let mut expr = parse_expr(toks)?;
+                            while let Some(v) = vars.pop() {
+                                expr = Expr::Lambda(v, expr.into());
+                            }
+                            Ok(expr)
+                        }
+                        _ if vars.len() == 1 => Ok(Expr::Var(vars.pop().unwrap())),
+                        Some((tok, i)) => Err((format!("Expected '=>', found {tok}"), Some(*i))),
+                        None => Err(("Expected '=>', but found nothing".into(), None)),
+                    }
                 } else {
-                    let mut exprs = vec![expr];
-                    while let Some((Tok::Ampersand, _)) = toks.peek() {
+                    let expr = parse_expr(toks)?;
+                    if let Some((Tok::Colon, _)) = toks.peek() {
                         toks.next();
-                        exprs.push(parse_expr(toks)?);
-                    }
-                    expect(toks, Tok::RParen)?;
-                    if exprs.len() == 1 {
-                        Ok(exprs.pop().unwrap())
+                        let v = parse_expr(toks)?;
+                        let mut exprs = vec![(expr, v)];
+                        while let Some((Tok::Comma, _)) = toks.peek() {
+                            toks.next();
+                            let k = parse_expr(toks)?;
+                            expect(toks, Tok::Colon)?;
+                            let v = parse_expr(toks)?;
+                            exprs.push((k, v))
+                        }
+                        expect(toks, Tok::RParen)?;
+                        Ok(Expr::TimeLoop(exprs))
                     } else {
-                        Ok(Expr::TimeLoop(
-                            exprs.into_iter().map(|v| (v.clone(), v)).collect(),
-                        ))
+                        let mut exprs = vec![expr];
+                        while let Some((Tok::Ampersand, _)) = toks.peek() {
+                            toks.next();
+                            exprs.push(parse_expr(toks)?);
+                        }
+                        expect(toks, Tok::RParen)?;
+                        if exprs.len() == 1 {
+                            Ok(exprs.pop().unwrap())
+                        } else {
+                            Ok(Expr::TimeLoop(
+                                exprs.into_iter().map(|v| (v.clone(), v)).collect(),
+                            ))
+                        }
                     }
                 }
             }
@@ -183,6 +237,7 @@ fn parse(code: &str) -> Result<Expr, String> {
             | Tok::Comma
             | Tok::DoubleEq
             | Tok::Ampersand
+            | Tok::FatArrow
             | Tok::Num(_)
             | Tok::Keyword(_) => Err((format!("Expected an expression, found {tok}"), Some(i))),
         }
@@ -223,6 +278,7 @@ impl Env {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum Val {
+    Var(String),
     String(String),
     Lambda(String, Box<Expr>, Rc<Env>),
     TimeLoop(BTreeMap<Val, Val>),
@@ -278,7 +334,7 @@ fn simplify(v: Val) -> Val {
 impl Val {
     fn rank(&self) -> usize {
         match self {
-            Val::String(_) | Val::Lambda(_, _, _) => 0,
+            Val::Var(_) | Val::String(_) | Val::Lambda(_, _, _) => 0,
             Val::TimeLoop(vals) => {
                 vals.iter()
                     .map(|(k, _v)| k.rank())
@@ -293,6 +349,7 @@ impl Val {
 impl std::fmt::Display for Val {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Val::Var(v) => f.write_str(v),
             Val::String(s) => write!(f, "'{s}'"),
             Val::TimeLoop(vals) => {
                 f.write_str("(")?;
@@ -314,8 +371,46 @@ impl std::fmt::Display for Val {
                 f.write_str(")")
             }
             Val::Lambda(param, body, env) => {
-                write!(f, "{param} => {body:?}@{env:?}")
+                let mut vars = vec![param.as_str()];
+                let mut body = body.as_ref();
+                while let Expr::Lambda(v, inner) = body {
+                    vars.push(v);
+                    body = inner.as_ref();
+                }
+                write!(f, "(({})", vars.join(", "))?;
+                f.write_str(" => ")?;
+                match Val::try_from(body.clone()) {
+                    Ok(val) => write!(f, "{val}")?,
+                    Err(()) => write!(f, " => {body:?}")?,
+                }
+                match env.as_ref() {
+                    Env::Nil => {}
+                    _ => write!(f, "@{env:?}")?,
+                }
+                f.write_str(")")
             }
+        }
+    }
+}
+
+impl TryFrom<Expr> for Val {
+    type Error = ();
+
+    fn try_from(expr: Expr) -> Result<Self, Self::Error> {
+        match expr {
+            Expr::App(_, _) | Expr::Eq(_) => Err(()),
+            Expr::Var(v) => Ok(Val::Var(v)),
+            Expr::String(s) => Ok(Val::String(s)),
+            Expr::TimeLoop(items) => {
+                let mut vals = BTreeMap::new();
+                for (k, v) in items {
+                    let k = k.try_into()?;
+                    let v = v.try_into()?;
+                    vals.insert(k, v);
+                }
+                Ok(Val::TimeLoop(vals))
+            }
+            Expr::Lambda(v, body) => Ok(Val::Lambda(v, body, Rc::new(Env::Nil))),
         }
     }
 }
@@ -338,6 +433,10 @@ fn eq(a: Val, b: Val) -> Result<Val, String> {
     let rank_a = a.rank();
     let rank_b = b.rank();
     match (a, b) {
+        (Val::Var(a), Val::Var(b)) if a == b => Ok(_true()),
+        (Val::Var(_), Val::Var(_))
+        | (Val::Var(_), Val::String(_))
+        | (Val::String(_), Val::Var(_)) => Ok(_false()),
         (Val::String(a), Val::String(b)) if a == b => Ok(_true()),
         (Val::String(_), Val::String(_)) => Ok(_false()),
         (a @ Val::Lambda(_, _, _), b) | (a, b @ Val::Lambda(_, _, _)) => {
@@ -368,7 +467,10 @@ fn eq(a: Val, b: Val) -> Result<Val, String> {
             }
             Ok(Val::time_loop(compared))
         }
-        (Val::String(_), Val::TimeLoop(_)) | (Val::TimeLoop(_), Val::String(_)) => unreachable!(),
+        (Val::String(_), Val::TimeLoop(_))
+        | (Val::TimeLoop(_), Val::String(_))
+        | (Val::Var(_), Val::TimeLoop(_))
+        | (Val::TimeLoop(_), Val::Var(_)) => unreachable!(),
     }
 }
 
@@ -376,6 +478,7 @@ fn app(f: Val, arg: Val) -> Result<Val, String> {
     let rank_f = f.rank();
     let rank_arg = arg.rank();
     match f {
+        Val::Var(v) => Err(format!("Cannot apply the var {v} to the argument {arg}")),
         Val::String(s) => Err(format!("Cannot apply the string {s} to the argument {arg}")),
         Val::Lambda(param, body, env) => body.eval(&env.set(param, arg)),
         Val::TimeLoop(f) => match arg {
@@ -479,7 +582,7 @@ mod tests {
     }
 
     #[test]
-    fn simple_liar() -> Result<(), String> {
+    fn simple_liar1() -> Result<(), String> {
         let v = "('x' & 'y')";
         let code = format!(
             "
@@ -487,6 +590,21 @@ mod tests {
             'y'
         else:
             'x'
+        "
+        );
+        assert_eq!(eval(&code)?, v);
+        Ok(())
+    }
+
+    #[test]
+    fn simple_liar2() -> Result<(), String> {
+        let v = "('x' & 'y')";
+        let code = format!(
+            "
+        if {v} == 'x':
+            'x'
+        else:
+            'y'
         "
         );
         assert_eq!(eval(&code)?, v);
@@ -600,6 +718,50 @@ mod tests {
                 'x'
         "
         );
+        assert_eq!(eval(&code)?, v);
+        Ok(())
+    }
+
+    #[test]
+    fn lambda_idiot1() -> Result<(), String> {
+        let t = "((t, f) => t)";
+        let f = "((t, f) => f)";
+        let v = t;
+        let code = format!("{t}({t}, {f})");
+        println!("{code}");
+        assert_eq!(eval(&code)?, v);
+        Ok(())
+    }
+
+    #[test]
+    fn lambda_idiot2() -> Result<(), String> {
+        let t = "((t, f) => t)";
+        let f = "((t, f) => f)";
+        let v = f;
+        let code = format!("{v}({t}, {f})");
+        println!("{code}");
+        assert_eq!(eval(&code)?, v);
+        Ok(())
+    }
+
+    #[test]
+    fn lambda_liar1() -> Result<(), String> {
+        let t = "((t, f) => t)";
+        let f = "((t, f) => f)";
+        let v = format!("({f} & {t})");
+        let code = format!("{v}({f}, {t})");
+        println!("{code}");
+        assert_eq!(eval(&code)?, v);
+        Ok(())
+    }
+
+    #[test]
+    fn lambda_liar2() -> Result<(), String> {
+        let t = "((t, f) => t)";
+        let f = "((t, f) => f)";
+        let v = format!("({f} & {t})");
+        let code = format!("{v}({t}, {f})");
+        println!("{code}");
         assert_eq!(eval(&code)?, v);
         Ok(())
     }
