@@ -1,4 +1,4 @@
-# Flat stack lists -- Compound data on the stack with mark-and-compact on return
+# Flat stack lists — Immutable lists entirely on the stack
 
 What would a functional programming language with immutable values look like if we kept all values (even structs and arrays) entirely on the stack, without needing a static type system?
 
