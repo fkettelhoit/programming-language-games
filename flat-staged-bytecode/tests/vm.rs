@@ -402,6 +402,86 @@ fn set_in_borrowed_list() {
     );
 }
 
+// --- Get ----------------------------------------------------------------
+
+#[test]
+fn get_atom_from_direct_list() {
+    // get([1, 2], 0) — the whole extent dies; the atom lands at its base
+    assert_eq!(
+        values(vec![Int(1), Int(2), Sized(List { elems: 2 }, 0), Int(0), Sized(Get, 0)]),
+        [Int(1)]
+    );
+}
+
+#[test]
+fn get_compound_element_through_handle() {
+    // (λx. len(x[0]))([[7, 8], 9]) = 2 — the borrowed Get yields a rebased
+    // ref to the inner list; Len follows it, so an off-by-anything in the
+    // rebase fails loudly here.
+    assert_eq!(
+        values(vec![
+            Sized(FuncStart, 4),         // 0
+            Var { elem: 0 },             // 1  x
+            Int(0),                      // 2
+            Sized(Get, 0),               // 3  x[0] -> ref to inner list
+            Sized(Len, 0),               // 4
+            Sized(FuncEnd { args: 1 }, 4), // 5
+            Int(7),                      // 6
+            Int(8),                      // 7
+            Sized(List { elems: 2 }, 0), // 8  inner
+            Int(9),                      // 9
+            Sized(List { elems: 2 }, 0), // 10 outer
+            Sized(Call { args: 1 }, 0),  // 11
+        ]),
+        [Int(2)]
+    );
+}
+
+#[test]
+fn get_surviving_ref_from_direct_list() {
+    // (λx. len(get([x[0], 5], 0)))([[7, 8], 9]) = 2 — the local list dies
+    // under Get, but its element 0 borrows data below the dying extent, so
+    // the ref survives via the downward rebase (base - target), the only
+    // downward move in the VM.
+    assert_eq!(
+        values(vec![
+            Sized(FuncStart, 8),           // 0
+            Var { elem: 0 },               // 1  x
+            Int(0),                        // 2
+            Sized(Get, 0),                 // 3  x[0] -> ref to inner list
+            Int(5),                        // 4
+            Sized(List { elems: 2 }, 0),   // 5  ys = [x[0], 5], direct
+            Int(0),                        // 6
+            Sized(Get, 0),                 // 7  get(ys, 0): direct, ref survives
+            Sized(Len, 0),                 // 8
+            Sized(FuncEnd { args: 1 }, 8), // 9
+            Int(7),                        // 10
+            Int(8),                        // 11
+            Sized(List { elems: 2 }, 0),   // 12 inner
+            Int(9),                        // 13
+            Sized(List { elems: 2 }, 0),   // 14 outer arg
+            Sized(Call { args: 1 }, 0),    // 15
+        ]),
+        [Int(2)]
+    );
+}
+
+#[test]
+fn get_empty_list_element() {
+    // get([[], 5], 0) — an empty list is the one legal 1-slot marker in an
+    // element slot; it moves verbatim to the dying extent's base.
+    assert_eq!(
+        values(vec![
+            Sized(List { elems: 0 }, 0),
+            Int(5),
+            Sized(List { elems: 2 }, 0),
+            Int(0),
+            Sized(Get, 0),
+        ]),
+        [Sized(List { elems: 0 }, 0)]
+    );
+}
+
 // --- If ----------------------------------------------------------------
 
 /// λn. if n == 0 { 1 } else { 7 }, called with `n`.
@@ -563,4 +643,127 @@ fn countdown_recursion() {
         ]),
         [Int(0)]
     );
+}
+
+// --- higher-order functions ---------------------------------------------------
+//
+// map and fold, hand-compiled with threading recursion: the function receives
+// itself as arg 0, the worker f flows as an ordinary FuncEnd handle, and list
+// access goes through Var handles (Get's O(1) borrow path).
+
+/// Assert the tape's top value is a list whose elements are exactly `expected`.
+fn assert_result_list(tape: &[Slot], expected: &[Slot]) {
+    let Some(&Sized(List { elems }, _)) = tape.last() else {
+        panic!("expected a list on top, got {:?}", tape.last());
+    };
+    assert_eq!(elems, expected.len());
+    assert_eq!(&tape[tape.len() - 1 - elems..tape.len() - 1], expected);
+}
+
+#[test]
+fn fold_add_over_list() {
+    // fold(add, 0, [1, 2, 3]) = 6
+    // fold_impl = λ(self, f, i, acc, xs).
+    //     if i == len(xs) { acc } else { self(self, f, i+1, f(acc, xs[i]), xs) }
+    let tape = run(vec![
+        Sized(FuncStart, 24),           // 0  fold_impl
+        Sized(FuncStart, 1),            // 1  then-arm: acc
+        Var { elem: 3 },                // 2
+        Sized(FuncEnd { args: 0 }, 1),  // 3
+        Sized(FuncStart, 14),           // 4  else-arm
+        Var { elem: 0 },                // 5  callee: self
+        Var { elem: 0 },                // 6  arg0: self
+        Var { elem: 1 },                // 7  arg1: f
+        Var { elem: 2 },                // 8  arg2: i + 1
+        Int(1),                         // 9
+        Sized(Bin(BinSlot::Add), 0),    // 10
+        Var { elem: 1 },                // 11 callee: f
+        Var { elem: 3 },                // 12 acc
+        Var { elem: 4 },                // 13 xs
+        Var { elem: 2 },                // 14 i
+        Sized(Get, 0),                  // 15 xs[i]
+        Sized(Call { args: 2 }, 0),     // 16 arg3: f(acc, xs[i])
+        Var { elem: 4 },                // 17 arg4: xs
+        Sized(Call { args: 5 }, 0),     // 18
+        Sized(FuncEnd { args: 0 }, 14), // 19
+        Var { elem: 2 },                // 20 cond: i == len(xs)
+        Var { elem: 4 },                // 21
+        Sized(Len, 0),                  // 22
+        Sized(Bin(BinSlot::Eq), 0),     // 23
+        Sized(If, 0),                   // 24
+        Sized(FuncEnd { args: 5 }, 24), // 25
+        Sized(FuncStart, 3),            // 26 add = λ(a, b). a + b
+        Var { elem: 0 },                // 27
+        Var { elem: 1 },                // 28
+        Sized(Bin(BinSlot::Add), 0),    // 29
+        Sized(FuncEnd { args: 2 }, 3),  // 30
+        Ref { offset: 6 },              // 31 callee: fold_impl (-> 25)
+        Ref { offset: 7 },              // 32 self (-> 25)
+        Ref { offset: 3 },              // 33 f: add (-> 30)
+        Int(0),                         // 34 i
+        Int(0),                         // 35 acc
+        Int(1),                         // 36 xs...
+        Int(2),                         // 37
+        Int(3),                         // 38
+        Sized(List { elems: 3 }, 0),    // 39
+        Sized(Call { args: 5 }, 0),     // 40
+    ]);
+    assert_eq!(tape.last(), Some(&Int(6)));
+}
+
+#[test]
+fn map_double_over_list() {
+    // map(double, [1, 2, 3]) = [2, 4, 6]
+    // map_impl = λ(self, f, i, acc, xs).
+    //     if i == len(xs) { push(acc) }    -- fresh copy: returning the borrow
+    //                                      -- of acc itself would be the 4-pass
+    //                                      -- compaction case; the copy makes
+    //                                      -- every return a list-marker return
+    //     else { self(self, f, i+1, push(acc, f(xs[i])), xs) }
+    let tape = run(vec![
+        Sized(FuncStart, 26),           // 0  map_impl
+        Sized(FuncStart, 2),            // 1  then-arm: push(acc)
+        Var { elem: 3 },                // 2
+        Sized(Push { elems: 0 }, 0),    // 3
+        Sized(FuncEnd { args: 0 }, 2),  // 4
+        Sized(FuncStart, 15),           // 5  else-arm
+        Var { elem: 0 },                // 6  callee: self
+        Var { elem: 0 },                // 7  arg0: self
+        Var { elem: 1 },                // 8  arg1: f
+        Var { elem: 2 },                // 9  arg2: i + 1
+        Int(1),                         // 10
+        Sized(Bin(BinSlot::Add), 0),    // 11
+        Var { elem: 3 },                // 12 arg3: push(acc, f(xs[i]))
+        Var { elem: 1 },                // 13 callee: f
+        Var { elem: 4 },                // 14 xs
+        Var { elem: 2 },                // 15 i
+        Sized(Get, 0),                  // 16 xs[i]
+        Sized(Call { args: 1 }, 0),     // 17 f(xs[i])
+        Sized(Push { elems: 1 }, 0),    // 18
+        Var { elem: 4 },                // 19 arg4: xs
+        Sized(Call { args: 5 }, 0),     // 20
+        Sized(FuncEnd { args: 0 }, 15), // 21
+        Var { elem: 2 },                // 22 cond: i == len(xs)
+        Var { elem: 4 },                // 23
+        Sized(Len, 0),                  // 24
+        Sized(Bin(BinSlot::Eq), 0),     // 25
+        Sized(If, 0),                   // 26
+        Sized(FuncEnd { args: 5 }, 26), // 27
+        Sized(FuncStart, 3),            // 28 double = λx. x + x
+        Var { elem: 0 },                // 29
+        Var { elem: 0 },                // 30
+        Sized(Bin(BinSlot::Add), 0),    // 31
+        Sized(FuncEnd { args: 1 }, 3),  // 32
+        Ref { offset: 6 },              // 33 callee: map_impl (-> 27)
+        Ref { offset: 7 },              // 34 self (-> 27)
+        Ref { offset: 3 },              // 35 f: double (-> 32)
+        Int(0),                         // 36 i
+        Sized(List { elems: 0 }, 0),    // 37 acc = []
+        Int(1),                         // 38 xs...
+        Int(2),                         // 39
+        Int(3),                         // 40
+        Sized(List { elems: 3 }, 0),    // 41
+        Sized(Call { args: 5 }, 0),     // 42
+    ]);
+    assert_result_list(&tape, &[Int(2), Int(4), Int(6)]);
 }

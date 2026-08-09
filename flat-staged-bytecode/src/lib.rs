@@ -8,7 +8,6 @@ pub enum Slot {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SizedSlot {
-    // TODO: does it make sense that FuncStart and BlobStart are here? Even though their size is reversed?
     BlobStart,
     BlobEnd,
     FuncStart,
@@ -97,7 +96,7 @@ impl Vm {
         match self.stack[src] {
             Int(i) => Ok(Int(i)),
             Var { .. } => Err(ERR_UNRESOLVED_VAR),
-            Ref { offset } if offset >= src => Err(ERR_INVALID_REF),
+            Ref { offset } if offset > src => Err(ERR_INVALID_REF),
             Ref { offset } => Ok(Ref { offset: dst - (src - offset) }),
             Sized(_, _) => Ok(Ref { offset: dst - src }),
         }
@@ -128,10 +127,6 @@ impl Vm {
             Some(CallFrame { args, .. }) if n >= *args => return Err(ERR_VAR_OUT_OF_BOUNDS),
             Some(CallFrame { base, .. }) => Ok(base + n),
         }
-    }
-
-    fn compact_list_result(&mut self, sp_list: usize, result: Slot) -> Result<(), &'static str> {
-        todo!()
     }
 
     fn eval_once(&mut self, comptime: bool) -> Result<(), &'static str> {
@@ -194,8 +189,6 @@ impl Vm {
                 let ret = self.ip + 1;
                 slots += self.stack[self.sp() - slots].size();
                 match self.stack[sp_f] {
-                    // Sized(FuncStart { args: a }, _) if args != a => return Err(ERR_INVALID_ARITY),
-                    // Sized(FuncStart { args: _ }, _) => self.ip = sp_f + 1,
                     Sized(FuncEnd { args: a }, _) if args != a => return Err(ERR_INVALID_ARITY),
                     Sized(FuncEnd { .. }, slots) => self.ip = sp_f - slots,
                     _ => return Err(ERR_INVALID_FUNC),
@@ -260,15 +253,32 @@ impl Vm {
                 let Int(i) = *i else {
                     return Err(ERR_INVALID_INT);
                 };
-                let sp_list = self.resolve_slot(self.sp() - 1)?;
-                let Sized(List { elems }, _) = self.stack[sp_list] else {
+                let sp_op = self.sp() - 1;
+                let sp_list = self.resolve_slot(sp_op)?;
+                let Sized(List { elems }, slots_list) = self.stack[sp_list] else {
                     return Err(ERR_INVALID_LIST);
                 };
                 if i < 0 || i as usize >= elems {
                     return Err(ERR_INDEX_OUT_OF_BOUNDS);
                 };
-                let result = self.borrow(sp_list - (elems - i as usize), self.stack.len())?;
-                self.compact_list_result(sp_list, result)?;
+                let sp_elem = sp_list - (elems - i as usize);
+                if sp_list != sp_op {
+                    self.stack[sp_op] = self.borrow(sp_elem, sp_op)?;
+                    self.stack.truncate(sp_op + 1);
+                } else {
+                    let base = sp_list - slots_list;
+                    let result = match self.stack[sp_elem] {
+                        Int(i) => Int(i),
+                        Ref { offset } if sp_elem - offset < base => {
+                            Ref { offset: base - (sp_elem - offset) }
+                        }
+                        v @ Ref { .. } => todo!("needs full 4 pass compaction: {v:?}"),
+                        s @ Sized(List { elems: 0 }, 0) => s,
+                        _ => return Err(ERR_INVALID_LIST),
+                    };
+                    self.stack.truncate(base);
+                    self.stack.push(result);
+                }
                 self.ip += 1;
             }
             Sized(If, _) => {
@@ -317,14 +327,15 @@ impl Vm {
                 let (Int(a), Int(b)) = (*a, *b) else {
                     return Err(ERR_INVALID_INT);
                 };
-                self.stack.truncate(self.stack.len() - 2);
-                self.stack.push(match op {
+                let slot = match op {
                     BinSlot::Eq if a == b => Int(1),
                     BinSlot::Eq => Int(0),
                     BinSlot::Add => Int(a.checked_add(b).ok_or(ERR_INT_OVERFLOW)?),
                     BinSlot::Sub => Int(a.checked_sub(b).ok_or(ERR_INT_OVERFLOW)?),
                     BinSlot::Mul => Int(a.checked_mul(b).ok_or(ERR_INT_OVERFLOW)?),
-                });
+                };
+                self.stack.truncate(self.stack.len() - 2);
+                self.stack.push(slot);
                 self.ip += 1;
             }
         }
