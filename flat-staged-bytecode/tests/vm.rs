@@ -420,18 +420,18 @@ fn get_compound_element_through_handle() {
     // rebase fails loudly here.
     assert_eq!(
         values(vec![
-            Sized(FuncStart, 4),         // 0
-            Var { elem: 0 },             // 1  x
-            Int(0),                      // 2
-            Sized(Get, 0),               // 3  x[0] -> ref to inner list
-            Sized(Len, 0),               // 4
+            Sized(FuncStart, 4),           // 0
+            Var { elem: 0 },               // 1  x
+            Int(0),                        // 2
+            Sized(Get, 0),                 // 3  x[0] -> ref to inner list
+            Sized(Len, 0),                 // 4
             Sized(FuncEnd { args: 1 }, 4), // 5
-            Int(7),                      // 6
-            Int(8),                      // 7
-            Sized(List { elems: 2 }, 0), // 8  inner
-            Int(9),                      // 9
-            Sized(List { elems: 2 }, 0), // 10 outer
-            Sized(Call { args: 1 }, 0),  // 11
+            Int(7),                        // 6
+            Int(8),                        // 7
+            Sized(List { elems: 2 }, 0),   // 8  inner
+            Int(9),                        // 9
+            Sized(List { elems: 2 }, 0),   // 10 outer
+            Sized(Call { args: 1 }, 0),    // 11
         ]),
         [Int(2)]
     );
@@ -480,6 +480,127 @@ fn get_empty_list_element() {
         ]),
         [Sized(List { elems: 0 }, 0)]
     );
+}
+
+// --- closures ----------------------------------------------------------------
+//
+// A closure is a List whose FIRST element is the code handle, followed by the
+// captured values: a frozen call prefix. Call splices the captures (not the
+// code) below the call-site args, so Var(0..k) are captures and Var(k..) are
+// args; FuncEnd's declared arity counts captures + args. A recursive closure
+// simply captures its own code handle.
+
+#[test]
+fn closure_call_direct() {
+    // [code, 3](4) = 7, closure built and consumed at the call site
+    assert_eq!(
+        values(vec![
+            Sized(FuncStart, 3),           // 0  λ(n, x). n + x
+            Var { elem: 0 },               // 1  n (capture)
+            Var { elem: 1 },               // 2  x (arg)
+            Sized(Bin(BinSlot::Add), 0),   // 3
+            Sized(FuncEnd { args: 2 }, 3), // 4  1 capture + 1 arg
+            Ref { offset: 1 },             // 5  code handle -> 4
+            Int(3),                        // 6  capture
+            Sized(List { elems: 2 }, 0),   // 7  closure [code, 3]
+            Int(4),                        // 8  arg
+            Sized(Call { args: 1 }, 0),    // 9
+        ]),
+        [
+            Ref { offset: 6 }, // auto-pushed handle from walking the bracket
+            Int(7),            // result, slid down to the frame floor
+        ]
+    );
+}
+
+#[test]
+fn countdown_via_closure() {
+    // c = [code, code]; c(3) = 0 — a recursive closure captures its own code:
+    // Var(0) is the self-capture, recursion rebuilds [Var(0), Var(0)].
+    let tape = run(vec![
+        Sized(FuncStart, 16),           // 0
+        Sized(FuncStart, 1),            // 1  then-arm
+        Int(0),                         // 2
+        Sized(FuncEnd { args: 0 }, 1),  // 3
+        Sized(FuncStart, 7),            // 4  else-arm
+        Var { elem: 0 },                // 5  own code (callee elem)
+        Var { elem: 0 },                // 6  own code (self-capture)
+        Sized(List { elems: 2 }, 0),    // 7  rebuild [code, code]
+        Var { elem: 1 },                // 8  n
+        Int(1),                         // 9
+        Sized(Bin(BinSlot::Sub), 0),    // 10
+        Sized(Call { args: 1 }, 0),     // 11
+        Sized(FuncEnd { args: 0 }, 7),  // 12
+        Var { elem: 1 },                // 13
+        Int(0),                         // 14
+        Sized(Bin(BinSlot::Eq), 0),     // 15
+        Sized(If, 0),                   // 16
+        Sized(FuncEnd { args: 2 }, 16), // 17 1 capture + 1 arg
+        Ref { offset: 1 },              // 18 code handle -> 17
+        Ref { offset: 2 },              // 19 code handle -> 17
+        Sized(List { elems: 2 }, 0),    // 20 closure [code, code]
+        Int(3),                         // 21
+        Sized(Call { args: 1 }, 0),     // 22
+    ]);
+    assert_eq!(tape.last(), Some(&Int(0)));
+}
+
+#[test]
+fn returned_closure_applied() {
+    // apply(make_adder(3), 4) = 7 — the closure survives make_adder's return
+    // via the adopt-return, is normalized to a handle as apply's argument,
+    // and is called through that borrowed handle.
+    let tape = run(vec![
+        Sized(FuncStart, 3),           // 0  adder code = λ(n, x). n + x
+        Var { elem: 0 },               // 1
+        Var { elem: 1 },               // 2
+        Sized(Bin(BinSlot::Add), 0),   // 3
+        Sized(FuncEnd { args: 2 }, 3), // 4
+        Sized(FuncStart, 3),           // 5  make_adder = λn. [code, n]
+        Ref { offset: 2 },             // 6  code handle -> 4
+        Var { elem: 0 },               // 7  n
+        Sized(List { elems: 2 }, 0),   // 8
+        Sized(FuncEnd { args: 1 }, 3), // 9
+        Sized(FuncStart, 3),           // 10 apply = λ(g, x). g(x)
+        Var { elem: 0 },               // 11
+        Var { elem: 1 },               // 12
+        Sized(Call { args: 1 }, 0),    // 13
+        Sized(FuncEnd { args: 2 }, 3), // 14
+        Ref { offset: 1 },             // 15 callee: apply -> 14
+        Ref { offset: 7 },             // 16 callee: make_adder -> 9
+        Int(3),                        // 17
+        Sized(Call { args: 1 }, 0),    // 18 make_adder(3)
+        Int(4),                        // 19
+        Sized(Call { args: 2 }, 0),    // 20 apply(closure, 4)
+    ]);
+    assert_eq!(tape.last(), Some(&Int(7)));
+}
+
+#[test]
+fn closure_arity_mismatch() {
+    // [code, 3](4): captures + args = 2, but the code declares 3 — must error
+    expect_err(vec![
+        Sized(FuncStart, 1),           // 0
+        Int(0),                        // 1
+        Sized(FuncEnd { args: 3 }, 1), // 2
+        Ref { offset: 1 },             // 3  -> 2
+        Int(3),                        // 4
+        Sized(List { elems: 2 }, 0),   // 5
+        Int(4),                        // 6
+        Sized(Call { args: 1 }, 0),    // 7
+    ]);
+}
+
+#[test]
+fn closure_without_code() {
+    // element 0 must resolve to a FuncEnd
+    expect_err(vec![
+        Int(5),
+        Int(3),
+        Sized(List { elems: 2 }, 0),
+        Int(4),
+        Sized(Call { args: 1 }, 0),
+    ]);
 }
 
 // --- If ----------------------------------------------------------------

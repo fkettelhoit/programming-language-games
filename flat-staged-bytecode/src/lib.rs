@@ -180,23 +180,42 @@ impl Vm {
                 self.ip += 1;
             }
             Sized(Call { args }, _) => {
-                let mut slots = self.sum_size(self.sp(), args)?;
-                if slots > args {
-                    self.push_borrows(self.sp(), args)?;
-                    slots += args;
-                }
-                let sp_f = self.resolve_slot(self.sp() - slots)?;
+                let sp_args = self.sp();
+                let slots_args = self.sum_size(sp_args, args)?;
+                let sp_op = sp_args - slots_args;
+                let slots_op = self.stack[sp_op].size();
+                let sp_f = self.resolve_slot(sp_op)?;
                 let ret = self.ip + 1;
-                slots += self.stack[self.sp() - slots].size();
-                match self.stack[sp_f] {
+                let arity = match self.stack[sp_f] {
                     Sized(FuncEnd { args: a }, _) if args != a => return Err(ERR_INVALID_ARITY),
-                    Sized(FuncEnd { .. }, slots) => self.ip = sp_f - slots,
+                    Sized(FuncEnd { .. }, slots_f) => {
+                        if slots_args > args {
+                            self.push_borrows(sp_args, args)?;
+                        }
+                        self.ip = sp_f - slots_f;
+                        args
+                    }
+                    Sized(List { elems }, _) if elems > 0 => {
+                        let sp_code = self.resolve_slot(sp_f - elems)?;
+                        match self.stack[sp_code] {
+                            Sized(FuncEnd { args: a }, _) if elems - 1 + args != a => {
+                                return Err(ERR_INVALID_ARITY);
+                            }
+                            Sized(FuncEnd { .. }, slots_code) => {
+                                self.push_borrows(sp_f - 1, elems - 1)?;
+                                self.push_borrows(sp_args, args)?;
+                                self.ip = sp_code - slots_code;
+                                elems - 1 + args
+                            }
+                            _ => return Err(ERR_INVALID_FUNC),
+                        }
+                    }
                     _ => return Err(ERR_INVALID_FUNC),
-                }
+                };
                 self.frames.push(CallFrame {
-                    floor: self.stack.len() - slots,
-                    base: self.stack.len() - args,
-                    args,
+                    floor: sp_op - slots_op + 1,
+                    base: self.stack.len() - arity,
+                    args: arity,
                     ret,
                 });
             }
