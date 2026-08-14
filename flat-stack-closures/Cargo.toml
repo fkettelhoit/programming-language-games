@@ -1,5 +1,5 @@
 [package]
-name = "flat-staged-bytecode"
+name = "flat-stack-closures"
 version = "0.1.0"
 edition = "2024"
 

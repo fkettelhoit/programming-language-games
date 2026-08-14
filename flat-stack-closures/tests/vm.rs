@@ -1,6 +1,6 @@
+use flat_stack_closures::{BinOp, Op, SizedOp, Vm};
 use Op::*;
 use SizedOp::*;
-use flat_staged_bytecode::{BinOp, Op, SizedOp, Vm};
 
 fn run(program: Vec<Op>) -> Vec<Op> {
     let mut vm = Vm::load(program);
