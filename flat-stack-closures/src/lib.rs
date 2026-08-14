@@ -25,7 +25,6 @@ pub enum SizedOp {
     FuncStart,
     FuncEnd { args: usize },
     Call { args: usize },
-    Macro { args: usize },
     List { elems: usize },
     Push { elems: usize },
     Set,
@@ -212,7 +211,7 @@ impl Vm {
         Ok(())
     }
 
-    fn eval_once(&mut self, comptime: bool) -> Result<(), &'static str> {
+    fn eval_once(&mut self) -> Result<(), &'static str> {
         let op = self.stack.get(self.ip).ok_or(ERR_NO_OP)?.op;
         match op {
             Int(i) => {
@@ -230,8 +229,6 @@ impl Vm {
                 self.stack.push(self.borrow(self.resolve_var(elem)?, self.stack.len())?);
                 self.ip += 1;
             }
-            Sized(FuncStart, _) if comptime => todo!(),
-            Sized(FuncEnd { .. }, _) if comptime => todo!(),
             Sized(FuncStart, slots) | Sized(BlobStart, slots) => {
                 let offset = (self.sp() - self.ip).checked_sub(slots).ok_or(ERR_UNDERFLOW)?;
                 self.push(Ref { offset });
@@ -258,10 +255,6 @@ impl Vm {
                 self.ip = ret;
             }
             Sized(BlobEnd, _) => return Err(ERR_BLOB_END),
-            Sized(Call { args }, _) if comptime => {
-                self.push(Sized(Call { args }, self.sum_size(self.sp(), args)?));
-                self.ip += 1;
-            }
             Sized(Call { args }, _) => {
                 let sp_args = self.sp();
                 let slots_args = self.sum_size(sp_args, args)?;
@@ -302,7 +295,6 @@ impl Vm {
                     ret,
                 });
             }
-            Sized(Macro { args }, slots) => todo!(),
             Sized(List { elems }, _) => {
                 let mut slots = self.sum_size(self.sp(), elems)?;
                 if slots > elems {
@@ -454,7 +446,7 @@ impl Vm {
 
     pub fn run(&mut self) -> Result<(), &'static str> {
         while self.ip != self.end {
-            self.eval_once(false)?;
+            self.eval_once()?;
             if self.ip > self.end {
                 return Err(ERR_NO_OP);
             }
