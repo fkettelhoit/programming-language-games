@@ -674,21 +674,18 @@ fn expect_err(program: Vec<Op>) {
 }
 
 #[test]
-#[ignore = "hardening deferred until the experiment is built out"]
 fn malformed_if_at_stack_bottom() {
     // cond is a program slot after ip; true-arm position underflows
     expect_err(vec![Sized(If, 0), Int(5)]);
 }
 
 #[test]
-#[ignore = "hardening deferred until the experiment is built out"]
 fn malformed_len_through_crafted_ref() {
     // Ref{9} read as the Len operand; target position underflows
     expect_err(vec![Sized(Len, 0), Ref { offset: 9 }]);
 }
 
 #[test]
-#[ignore = "hardening deferred until the experiment is built out"]
 fn malformed_len_of_oversized_marker() {
     // crafted List marker claims more slots than the stack holds
     expect_err(vec![Sized(Len, 0), Sized(List { elems: 2 }, 9)]);
@@ -701,7 +698,6 @@ fn malformed_call_through_crafted_ref() {
 }
 
 #[test]
-#[ignore = "hardening deferred until the experiment is built out"]
 fn malformed_call_of_oversized_funcend() {
     // crafted FuncEnd claims a 9-slot body; entry address underflows
     expect_err(vec![Sized(Call { args: 0 }, 0), Sized(FuncEnd { args: 0 }, 9)]);
@@ -715,7 +711,6 @@ fn malformed_call_of_oversized_funcstart() {
 }
 
 #[test]
-#[ignore = "hardening deferred until the experiment is built out"]
 fn malformed_bracket_larger_than_tape() {
     // FuncStart whose extent runs past the end of the program
     expect_err(vec![Sized(FuncStart, 9)]);
@@ -1087,12 +1082,12 @@ fn stale_shift_below_floor() {
             Sized(Call { args: 1 }, 0),    // 19 apply(closure) (callee: apply handle)
         ]),
         [
-            Ref { offset: 16 },          // leftover handle from walking code's bracket
+            Ref { offset: 16 }, // leftover handle from walking code's bracket
             Int(3),
             Int(3),
             Sized(List { elems: 2 }, 2), // the capture list, ghost of the result
-            Ref { offset: 1 },           // result[0] -> capture list (one too low if stale shift is read)
-            Int(9),                      // result[1]
+            Ref { offset: 1 }, // result[0] -> capture list (one too low if stale shift is read)
+            Int(9),            // result[1]
             Sized(List { elems: 2 }, 5), // result — root, re-marked
         ]
     );

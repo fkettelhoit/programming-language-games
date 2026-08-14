@@ -90,7 +90,7 @@ const ERR_INVALID_LIST: &str = "Invalid list";
 const ERR_INVALID_INT: &str = "Invalid int";
 const ERR_INT_OVERFLOW: &str = "Int overflow";
 const ERR_BLOB_END: &str = "Found unexpected blob end instruction";
-const ERR_STACK_UNDERFLOW: &str = "Stack underflow";
+const ERR_UNDERFLOW: &str = "Stack underflow";
 
 impl Vm {
     pub fn load(code: Vec<Op>) -> Self {
@@ -103,7 +103,7 @@ impl Vm {
     }
 
     fn op(&self, sp: usize) -> Result<Op, &'static str> {
-        Ok(self.stack.get(sp).ok_or(ERR_STACK_UNDERFLOW)?.op)
+        Ok(self.stack.get(sp).ok_or(ERR_UNDERFLOW)?.op)
     }
 
     fn push(&mut self, op: Op) {
@@ -113,8 +113,8 @@ impl Vm {
     fn sum_size(&self, src: usize, n: usize) -> Result<usize, &'static str> {
         let mut sp = src;
         for _ in 0..n {
-            let size = self.stack.get(sp).ok_or(ERR_STACK_UNDERFLOW)?.size();
-            sp = sp.checked_sub(size).ok_or(ERR_STACK_UNDERFLOW)?;
+            let size = self.stack.get(sp).ok_or(ERR_UNDERFLOW)?.size();
+            sp = sp.checked_sub(size).ok_or(ERR_UNDERFLOW)?;
         }
         Ok(src - sp)
     }
@@ -135,13 +135,13 @@ impl Vm {
         for i in 0..n {
             let slot = self.stack[src];
             self.stack[top - i] = self.borrow(src, top - i)?;
-            src = src.checked_sub(slot.size()).ok_or(ERR_STACK_UNDERFLOW)?;
+            src = src.checked_sub(slot.size()).ok_or(ERR_UNDERFLOW)?;
         }
         Ok(())
     }
 
     fn resolve_slot(&self, sp: usize) -> Result<usize, &'static str> {
-        match self.stack[sp].op {
+        match self.op(sp)? {
             Var { .. } => return Err(ERR_UNRESOLVED_VAR),
             Ref { offset } => sp.checked_sub(offset).ok_or(ERR_INVALID_REF),
             _ => Ok(sp),
@@ -158,7 +158,7 @@ impl Vm {
 
     fn mark(&mut self, sp: usize) -> Result<(), &'static str> {
         for sp in sp - self.stack[sp].size() + 1..=sp {
-            self.stack.get_mut(sp).ok_or(ERR_STACK_UNDERFLOW)?.meta.mark = true;
+            self.stack.get_mut(sp).ok_or(ERR_UNDERFLOW)?.meta.mark = true;
         }
         Ok(())
     }
@@ -169,7 +169,7 @@ impl Vm {
         match self.op(ret)? {
             Sized(List { elems: n } | Call { args: n }, _) => {
                 for sp in ret - n..=ret {
-                    self.stack.get_mut(sp).ok_or(ERR_STACK_UNDERFLOW)?.meta.mark = true;
+                    self.stack.get_mut(sp).ok_or(ERR_UNDERFLOW)?.meta.mark = true;
                 }
             }
             _ => self.mark(ret)?,
@@ -190,7 +190,7 @@ impl Vm {
             if slot.meta.mark {
                 if let Ref { offset } = slot.op {
                     let shift = if sp - offset >= floor {
-                        self.stack.get(sp - offset).ok_or(ERR_STACK_UNDERFLOW)?.meta.shift
+                        self.stack.get(sp - offset).ok_or(ERR_UNDERFLOW)?.meta.shift
                     } else {
                         0
                     };
@@ -206,9 +206,7 @@ impl Vm {
             }
         }
         self.stack.truncate(ret + 1 - gap);
-        if let Slot { op: Sized(_, slots), .. } =
-            self.stack.last_mut().ok_or(ERR_STACK_UNDERFLOW)?
-        {
+        if let Slot { op: Sized(_, slots), .. } = self.stack.last_mut().ok_or(ERR_UNDERFLOW)? {
             *slots = (ret - gap) - floor;
         }
         Ok(())
@@ -235,7 +233,8 @@ impl Vm {
             Sized(FuncStart, _) if comptime => todo!(),
             Sized(FuncEnd { .. }, _) if comptime => todo!(),
             Sized(FuncStart, slots) | Sized(BlobStart, slots) => {
-                self.push(Ref { offset: self.sp() - self.ip - slots });
+                let offset = (self.sp() - self.ip).checked_sub(slots).ok_or(ERR_UNDERFLOW)?;
+                self.push(Ref { offset });
                 self.ip += slots + 2;
             }
             Sized(FuncEnd { .. }, _) => {
@@ -276,7 +275,7 @@ impl Vm {
                         if slots_args > args {
                             self.push_borrows(sp_args, args)?;
                         }
-                        self.ip = sp_f - slots_f;
+                        self.ip = sp_f.checked_sub(slots_f).ok_or(ERR_UNDERFLOW)?;
                         args
                     }
                     Sized(List { elems }, _) if elems > 0 => {
@@ -333,7 +332,7 @@ impl Vm {
                     return Err(ERR_INVALID_INT);
                 };
                 let sp_elem = self.sp() - 1;
-                let elem_size = self.stack.get(sp_elem).ok_or(ERR_STACK_UNDERFLOW)?.size();
+                let elem_size = self.stack.get(sp_elem).ok_or(ERR_UNDERFLOW)?.size();
                 let sp_op = self.sp() - 1 - elem_size;
                 let sp_list = self.resolve_slot(sp_op)?;
                 let Sized(List { elems }, slots_old) = self.op(sp_list)? else {
@@ -351,7 +350,7 @@ impl Vm {
             }
             Sized(Get, _) => {
                 let [.., _, i] = self.stack.as_slice() else {
-                    return Err(ERR_STACK_UNDERFLOW);
+                    return Err(ERR_UNDERFLOW);
                 };
                 let Int(i) = i.op else {
                     return Err(ERR_INVALID_INT);
@@ -399,7 +398,8 @@ impl Vm {
                     return Err(ERR_INVALID_INT);
                 };
                 let f = self.sp() - 1;
-                let t = f - self.stack[f].size();
+                let size_f = self.stack.get(f).ok_or(ERR_UNDERFLOW)?.size();
+                let t = f.checked_sub(size_f).ok_or(ERR_UNDERFLOW)?;
                 let sp_f = self.resolve_slot(f)?;
                 let sp_t = self.resolve_slot(t)?;
                 match (self.op(sp_t)?, self.op(sp_f)?) {
@@ -416,16 +416,14 @@ impl Vm {
                 }
             }
             Sized(Len, _) => {
-                match self.op(self.sp())? {
-                    Ref { offset } => match self.op(self.sp() - offset)? {
-                        Sized(List { elems }, _) => {
-                            self.stack.pop();
-                            self.push(Int(elems as i64));
-                        }
-                        _ => return Err(ERR_INVALID_LIST),
-                    },
+                let sp_op = self.resolve_slot(self.sp())?;
+                match self.op(sp_op)? {
+                    Sized(List { elems }, _) if sp_op < self.sp() => {
+                        self.stack.pop();
+                        self.push(Int(elems as i64));
+                    }
                     Sized(List { elems }, slots) => {
-                        self.stack.truncate(self.sp() - slots);
+                        self.stack.truncate(self.sp().checked_sub(slots).ok_or(ERR_UNDERFLOW)?);
                         self.push(Int(elems as i64));
                     }
                     _ => return Err(ERR_INVALID_LIST),
@@ -434,7 +432,7 @@ impl Vm {
             }
             Sized(Bin(op), _) => {
                 let [.., a, b] = self.stack.as_slice() else {
-                    return Err(ERR_STACK_UNDERFLOW);
+                    return Err(ERR_UNDERFLOW);
                 };
                 let (Int(a), Int(b)) = (a.op, b.op) else {
                     return Err(ERR_INVALID_INT);
