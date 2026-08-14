@@ -1,17 +1,17 @@
-use SizedSlot::*;
-use Slot::*;
-use flat_staged_bytecode::{BinSlot, SizedSlot, Slot, Vm};
+use Op::*;
+use SizedOp::*;
+use flat_staged_bytecode::{BinOp, Op, SizedOp, Vm};
 
-fn run(program: Vec<Slot>) -> Vec<Slot> {
+fn run(program: Vec<Op>) -> Vec<Op> {
     let mut vm = Vm::load(program);
     if let Err(e) = vm.run() {
         panic!("VM error: {e}\n{vm:#?}");
     }
-    vm.stack
+    vm.stack.into_iter().map(|slot| slot.op).collect()
 }
 
 /// Run and return only the working region (everything above the program prefix).
-fn values(program: Vec<Slot>) -> Vec<Slot> {
+fn values(program: Vec<Op>) -> Vec<Op> {
     let prefix = program.len();
     let tape = run(program);
     tape[prefix..].to_vec()
@@ -65,11 +65,11 @@ fn nested_list_normalizes() {
 
 #[test]
 fn bin_ops() {
-    assert_eq!(values(vec![Int(40), Int(2), Sized(Bin(BinSlot::Add), 0)]), [Int(42)]);
-    assert_eq!(values(vec![Int(7), Int(2), Sized(Bin(BinSlot::Sub), 0)]), [Int(5)]);
-    assert_eq!(values(vec![Int(6), Int(7), Sized(Bin(BinSlot::Mul), 0)]), [Int(42)]);
-    assert_eq!(values(vec![Int(3), Int(3), Sized(Bin(BinSlot::Eq), 0)]), [Int(1)]);
-    assert_eq!(values(vec![Int(3), Int(4), Sized(Bin(BinSlot::Eq), 0)]), [Int(0)]);
+    assert_eq!(values(vec![Int(40), Int(2), Sized(Bin(BinOp::Add), 0)]), [Int(42)]);
+    assert_eq!(values(vec![Int(7), Int(2), Sized(Bin(BinOp::Sub), 0)]), [Int(5)]);
+    assert_eq!(values(vec![Int(6), Int(7), Sized(Bin(BinOp::Mul), 0)]), [Int(42)]);
+    assert_eq!(values(vec![Int(3), Int(3), Sized(Bin(BinOp::Eq), 0)]), [Int(1)]);
+    assert_eq!(values(vec![Int(3), Int(4), Sized(Bin(BinOp::Eq), 0)]), [Int(0)]);
 }
 
 // --- functions ----------------------------------------------------------------
@@ -154,19 +154,22 @@ fn calling_through_ref_twice() {
 }
 
 #[test]
-#[ignore = "returning a borrow of frame-local data requires the 4-pass compaction"]
 fn call_with_list_arg() {
     // (λx. x)([1, 2]) — the returned borrow points into the dying frame; the
-    // expected layout will be written together with the compaction.
-    run(vec![
-        Sized(FuncStart, 1),
-        Var { elem: 0 },
-        Sized(FuncEnd { args: 1 }, 1),
-        Int(1),
-        Int(2),
-        Sized(List { elems: 2 }, 0),
-        Sized(Call { args: 1 }, 0),
-    ]);
+    // compaction squeezes the dead function handle and slides the list down,
+    // so the caller receives the list itself at the frame floor.
+    assert_eq!(
+        values(vec![
+            Sized(FuncStart, 1),
+            Var { elem: 0 },
+            Sized(FuncEnd { args: 1 }, 1),
+            Int(1),
+            Int(2),
+            Sized(List { elems: 2 }, 0),
+            Sized(Call { args: 1 }, 0),
+        ]),
+        [Int(1), Int(2), Sized(List { elems: 2 }, 2)]
+    );
 }
 
 // --- blobs / refs ----------------------------------------------------------------
@@ -498,7 +501,7 @@ fn closure_call_direct() {
             Sized(FuncStart, 3),           // 0  λ(n, x). n + x
             Var { elem: 0 },               // 1  n (capture)
             Var { elem: 1 },               // 2  x (arg)
-            Sized(Bin(BinSlot::Add), 0),   // 3
+            Sized(Bin(BinOp::Add), 0),     // 3
             Sized(FuncEnd { args: 2 }, 3), // 4  1 capture + 1 arg
             Ref { offset: 1 },             // 5  code handle -> 4
             Int(3),                        // 6  capture
@@ -528,12 +531,12 @@ fn countdown_via_closure() {
         Sized(List { elems: 2 }, 0),    // 7  rebuild [code, code]
         Var { elem: 1 },                // 8  n
         Int(1),                         // 9
-        Sized(Bin(BinSlot::Sub), 0),    // 10
+        Sized(Bin(BinOp::Sub), 0),      // 10
         Sized(Call { args: 1 }, 0),     // 11
         Sized(FuncEnd { args: 0 }, 7),  // 12
         Var { elem: 1 },                // 13
         Int(0),                         // 14
-        Sized(Bin(BinSlot::Eq), 0),     // 15
+        Sized(Bin(BinOp::Eq), 0),       // 15
         Sized(If, 0),                   // 16
         Sized(FuncEnd { args: 2 }, 16), // 17 1 capture + 1 arg
         Ref { offset: 1 },              // 18 code handle -> 17
@@ -554,7 +557,7 @@ fn returned_closure_applied() {
         Sized(FuncStart, 3),           // 0  adder code = λ(n, x). n + x
         Var { elem: 0 },               // 1
         Var { elem: 1 },               // 2
-        Sized(Bin(BinSlot::Add), 0),   // 3
+        Sized(Bin(BinOp::Add), 0),     // 3
         Sized(FuncEnd { args: 2 }, 3), // 4
         Sized(FuncStart, 3),           // 5  make_adder = λn. [code, n]
         Ref { offset: 2 },             // 6  code handle -> 4
@@ -606,7 +609,7 @@ fn closure_without_code() {
 // --- If ----------------------------------------------------------------
 
 /// λn. if n == 0 { 1 } else { 7 }, called with `n`.
-fn if_prog(n: i64) -> Vec<Slot> {
+fn if_prog(n: i64) -> Vec<Op> {
     vec![
         Sized(FuncStart, 10), // 0
         Sized(FuncStart, 1),
@@ -617,7 +620,7 @@ fn if_prog(n: i64) -> Vec<Slot> {
         Sized(FuncEnd { args: 0 }, 1),  // 4..=6  else-arm
         Var { elem: 0 },                // 7
         Int(0),                         // 8
-        Sized(Bin(BinSlot::Eq), 0),     // 9
+        Sized(Bin(BinOp::Eq), 0),       // 9
         Sized(If, 0),                   // 10
         Sized(FuncEnd { args: 1 }, 10), // 11
         Int(n),                         // 12
@@ -652,9 +655,9 @@ fn non_tail_if() {
             Sized(FuncEnd { args: 0 }, 1),  // 5..=7  else-arm
             Var { elem: 0 },                // 8
             Int(0),                         // 9
-            Sized(Bin(BinSlot::Eq), 0),     // 10
+            Sized(Bin(BinOp::Eq), 0),       // 10
             Sized(If, 0),                   // 11
-            Sized(Bin(BinSlot::Add), 0),    // 12
+            Sized(Bin(BinOp::Add), 0),      // 12
             Sized(FuncEnd { args: 1 }, 12), // 13
             Int(5),                         // 14
             Sized(Call { args: 1 }, 0),     // 15
@@ -665,7 +668,7 @@ fn non_tail_if() {
 
 // --- malformed bytecode must error, never panic --------------------------------
 
-fn expect_err(program: Vec<Slot>) {
+fn expect_err(program: Vec<Op>) {
     let mut vm = Vm::load(program);
     assert!(vm.run().is_err(), "expected an error, got:\n{vm:#?}");
 }
@@ -750,12 +753,12 @@ fn countdown_recursion() {
             Var { elem: 0 },                // 6  self as arg 0
             Var { elem: 1 },                // 7  n
             Int(1),                         // 8
-            Sized(Bin(BinSlot::Sub), 0),    // 9
+            Sized(Bin(BinOp::Sub), 0),      // 9
             Sized(Call { args: 2 }, 0),     // 10
             Sized(FuncEnd { args: 0 }, 6),  // 11
             Var { elem: 1 },                // 12
             Int(0),                         // 13
-            Sized(Bin(BinSlot::Eq), 0),     // 14
+            Sized(Bin(BinOp::Eq), 0),       // 14
             Sized(If, 0),                   // 15
             Sized(FuncEnd { args: 2 }, 15), // 16
             Ref { offset: 1 },              // 17 duplicate self handle -> 16
@@ -773,7 +776,7 @@ fn countdown_recursion() {
 // access goes through Var handles (Get's O(1) borrow path).
 
 /// Assert the tape's top value is a list whose elements are exactly `expected`.
-fn assert_result_list(tape: &[Slot], expected: &[Slot]) {
+fn assert_result_list(tape: &[Op], expected: &[Op]) {
     let Some(&Sized(List { elems }, _)) = tape.last() else {
         panic!("expected a list on top, got {:?}", tape.last());
     };
@@ -797,7 +800,7 @@ fn fold_add_over_list() {
         Var { elem: 1 },                // 7  arg1: f
         Var { elem: 2 },                // 8  arg2: i + 1
         Int(1),                         // 9
-        Sized(Bin(BinSlot::Add), 0),    // 10
+        Sized(Bin(BinOp::Add), 0),      // 10
         Var { elem: 1 },                // 11 callee: f
         Var { elem: 3 },                // 12 acc
         Var { elem: 4 },                // 13 xs
@@ -810,13 +813,13 @@ fn fold_add_over_list() {
         Var { elem: 2 },                // 20 cond: i == len(xs)
         Var { elem: 4 },                // 21
         Sized(Len, 0),                  // 22
-        Sized(Bin(BinSlot::Eq), 0),     // 23
+        Sized(Bin(BinOp::Eq), 0),       // 23
         Sized(If, 0),                   // 24
         Sized(FuncEnd { args: 5 }, 24), // 25
         Sized(FuncStart, 3),            // 26 add = λ(a, b). a + b
         Var { elem: 0 },                // 27
         Var { elem: 1 },                // 28
-        Sized(Bin(BinSlot::Add), 0),    // 29
+        Sized(Bin(BinOp::Add), 0),      // 29
         Sized(FuncEnd { args: 2 }, 3),  // 30
         Ref { offset: 6 },              // 31 callee: fold_impl (-> 25)
         Ref { offset: 7 },              // 32 self (-> 25)
@@ -853,7 +856,7 @@ fn map_double_over_list() {
         Var { elem: 1 },                // 8  arg1: f
         Var { elem: 2 },                // 9  arg2: i + 1
         Int(1),                         // 10
-        Sized(Bin(BinSlot::Add), 0),    // 11
+        Sized(Bin(BinOp::Add), 0),      // 11
         Var { elem: 3 },                // 12 arg3: push(acc, f(xs[i]))
         Var { elem: 1 },                // 13 callee: f
         Var { elem: 4 },                // 14 xs
@@ -867,13 +870,13 @@ fn map_double_over_list() {
         Var { elem: 2 },                // 22 cond: i == len(xs)
         Var { elem: 4 },                // 23
         Sized(Len, 0),                  // 24
-        Sized(Bin(BinSlot::Eq), 0),     // 25
+        Sized(Bin(BinOp::Eq), 0),       // 25
         Sized(If, 0),                   // 26
         Sized(FuncEnd { args: 5 }, 26), // 27
         Sized(FuncStart, 3),            // 28 double = λx. x + x
         Var { elem: 0 },                // 29
         Var { elem: 0 },                // 30
-        Sized(Bin(BinSlot::Add), 0),    // 31
+        Sized(Bin(BinOp::Add), 0),      // 31
         Sized(FuncEnd { args: 1 }, 3),  // 32
         Ref { offset: 6 },              // 33 callee: map_impl (-> 27)
         Ref { offset: 7 },              // 34 self (-> 27)
@@ -887,4 +890,210 @@ fn map_double_over_list() {
         Sized(Call { args: 5 }, 0),     // 42
     ]);
     assert_result_list(&tape, &[Int(2), Int(4), Int(6)]);
+}
+
+// --- compaction ----------------------------------------------------------------
+//
+// The forced sites (ref-into-frame return, Get's compound extraction) and the
+// knob (compact a list return when the frame residue exceeds the value's own
+// extent). Layouts here pin the algorithm: per-slot marks, immobile shift
+// meta, root re-marked over its ghost.
+
+#[test]
+fn empty_list_return_compacts() {
+    // (λx. [])(0) — residue 2 > extent 0, so the knob compacts; the root is a
+    // bare marker with no elements, the smallest legal mark set.
+    assert_eq!(
+        values(vec![
+            Sized(FuncStart, 1),
+            Sized(List { elems: 0 }, 0),
+            Sized(FuncEnd { args: 1 }, 1),
+            Int(0),
+            Sized(Call { args: 1 }, 0),
+        ]),
+        [Sized(List { elems: 0 }, 0)]
+    );
+}
+
+#[test]
+fn knob_compacts_when_garbage_dominates() {
+    // (λx. dead = [9, 9]; [1, 2])(0) — residue 5 > extent 2: the knob picks
+    // compaction over adoption and the dead local list is squeezed out.
+    assert_eq!(
+        values(vec![
+            Sized(FuncStart, 6),
+            Int(9),
+            Int(9),
+            Sized(List { elems: 2 }, 0),
+            Int(1),
+            Int(2),
+            Sized(List { elems: 2 }, 0),
+            Sized(FuncEnd { args: 1 }, 6),
+            Int(0),
+            Sized(Call { args: 1 }, 0),
+        ]),
+        [Int(1), Int(2), Sized(List { elems: 2 }, 2)]
+    );
+}
+
+#[test]
+fn get_compound_element_from_direct_list() {
+    // get([[7, 8], 9], 0) — the extracted element is a borrow into the dying
+    // extent: the same routine runs with the extent base as the floor, and
+    // the caller receives the inner list itself at that base.
+    assert_eq!(
+        values(vec![
+            Int(7),
+            Int(8),
+            Sized(List { elems: 2 }, 0),
+            Int(9),
+            Sized(List { elems: 2 }, 0),
+            Int(0),
+            Sized(Get, 0),
+        ]),
+        [Int(7), Int(8), Sized(List { elems: 2 }, 2)]
+    );
+}
+
+#[test]
+fn len_of_compound_element_from_direct_list() {
+    // len(get([[7, 8], 9], 0)) = 2 — the compacted extraction is a live,
+    // walkable value.
+    assert_eq!(
+        values(vec![
+            Int(7),
+            Int(8),
+            Sized(List { elems: 2 }, 0),
+            Int(9),
+            Sized(List { elems: 2 }, 0),
+            Int(0),
+            Sized(Get, 0),
+            Sized(Len, 0),
+        ]),
+        [Int(2)]
+    );
+}
+
+#[test]
+fn root_adopts_ghost_and_shared_child() {
+    // (λy. y)((λa. [a, [a, 5]])([7, 8])) — the inner call adopt-returns
+    // w = [a, b] with b = [a, 5]; the outer identity return forces the passes.
+    // a is a shared child (marked once, both refs to it fixed independently),
+    // b survives as ghost below w's element run with its interior ref
+    // rewritten (the erratum-2 rule), the junk w adopted from the inner frame
+    // is squeezed back out (elements-only marking at the root), and the root
+    // marker is re-marked to cover the whole survivor block — without that,
+    // a and b would sit outside every extent and the caller's walks misparse.
+    assert_eq!(
+        values(vec![
+            Sized(FuncStart, 1),           // 0  identity
+            Var { elem: 0 },               // 1
+            Sized(FuncEnd { args: 1 }, 1), // 2
+            Sized(FuncStart, 5),           // 3  λa. [a, [a, 5]]
+            Var { elem: 0 },               // 4
+            Var { elem: 0 },               // 5
+            Int(5),                        // 6
+            Sized(List { elems: 2 }, 0),   // 7  b = [a, 5]
+            Sized(List { elems: 2 }, 0),   // 8  w = [a, b]
+            Sized(FuncEnd { args: 1 }, 5), // 9
+            Int(7),                        // 10
+            Int(8),                        // 11
+            Sized(List { elems: 2 }, 0),   // 12 arg [7, 8]
+            Sized(Call { args: 1 }, 0),    // 13 inner call (callee: λa handle)
+            Sized(Call { args: 1 }, 0),    // 14 outer call (callee: identity handle)
+        ]),
+        [
+            Int(7),
+            Int(8),
+            Sized(List { elems: 2 }, 2), // a — ghost, shared
+            Ref { offset: 1 },           // b[0] -> a
+            Int(5),
+            Sized(List { elems: 2 }, 2), // b — ghost
+            Ref { offset: 4 },           // w[0] -> a
+            Ref { offset: 2 },           // w[1] -> b
+            Sized(List { elems: 2 }, 8), // w — root, re-marked over the ghost
+        ]
+    );
+}
+
+#[test]
+fn transitive_mark_through_garbage_parent() {
+    // (λx. [x[1]])([3, [2, [99]], 4]) — the argument B is garbage, but its
+    // element A (borrowed out via Get) is live: the mark pass must walk B's
+    // extent slot by slot instead of skipping it, so A's whole extent
+    // (including the inline [99]) survives while B's marker, its other
+    // elements, and its handles are squeezed. The erratum-1 shape.
+    assert_eq!(
+        values(vec![
+            Sized(FuncStart, 4),           // 0
+            Var { elem: 0 },               // 1
+            Int(1),                        // 2
+            Sized(Get, 0),                 // 3  x[1] -> borrow of A
+            Sized(List { elems: 1 }, 0),   // 4  root [->A]
+            Sized(FuncEnd { args: 1 }, 4), // 5
+            Int(3),                        // 6
+            Int(2),                        // 7
+            Int(99),                       // 8
+            Sized(List { elems: 1 }, 0),   // 9  Z = [99]
+            Sized(List { elems: 2 }, 0),   // 10 A = [2, Z]
+            Int(4),                        // 11
+            Sized(List { elems: 3 }, 0),   // 12 B = [3, A, 4]
+            Sized(Call { args: 1 }, 0),    // 13
+        ]),
+        [
+            Int(2), // A's dead original operand (interior marking is whole-extent)
+            Int(99),
+            Sized(List { elems: 1 }, 1), // Z
+            Int(2),                      // A[0]
+            Ref { offset: 2 },           // A[1] -> Z
+            Sized(List { elems: 2 }, 5), // A
+            Ref { offset: 1 },           // root[0] -> A
+            Sized(List { elems: 1 }, 7), // root — re-marked
+        ]
+    );
+}
+
+#[test]
+fn stale_shift_below_floor() {
+    // apply(make([3, 3])) with make = λn. [code, n] and code = λ(cap, x).
+    // [cap, x]: make's return compacts (knob), stamping nonzero shift meta
+    // into the closure's slots — including the capture list's final position.
+    // The closure is then called through a borrowed handle, so its capture
+    // sits BELOW that call's floor, and the body's return compacts with a
+    // marked ref to it. The ref fix must treat below-floor targets as
+    // unmoved (shift 0); reading the stale stamp instead lands the ref one
+    // slot low, inside the capture's elements.
+    assert_eq!(
+        values(vec![
+            Sized(FuncStart, 3),           // 0  code = λ(cap, x). [cap, x]
+            Var { elem: 0 },               // 1
+            Var { elem: 1 },               // 2
+            Sized(List { elems: 2 }, 0),   // 3
+            Sized(FuncEnd { args: 2 }, 3), // 4
+            Sized(FuncStart, 3),           // 5  apply = λg. g(9)
+            Var { elem: 0 },               // 6
+            Int(9),                        // 7
+            Sized(Call { args: 1 }, 0),    // 8
+            Sized(FuncEnd { args: 1 }, 3), // 9
+            Sized(FuncStart, 3),           // 10 make = λn. [code, n]
+            Ref { offset: 7 },             // 11 code handle -> 4
+            Var { elem: 0 },               // 12
+            Sized(List { elems: 2 }, 0),   // 13
+            Sized(FuncEnd { args: 1 }, 3), // 14
+            Int(3),                        // 15
+            Int(3),                        // 16
+            Sized(List { elems: 2 }, 0),   // 17 n = [3, 3]
+            Sized(Call { args: 1 }, 0),    // 18 make(n) (callee: make handle)
+            Sized(Call { args: 1 }, 0),    // 19 apply(closure) (callee: apply handle)
+        ]),
+        [
+            Ref { offset: 16 },          // leftover handle from walking code's bracket
+            Int(3),
+            Int(3),
+            Sized(List { elems: 2 }, 2), // the capture list, ghost of the result
+            Ref { offset: 1 },           // result[0] -> capture list (one too low if stale shift is read)
+            Int(9),                      // result[1]
+            Sized(List { elems: 2 }, 5), // result — root, re-marked
+        ]
+    );
 }
