@@ -7,3 +7,4 @@ A collection of vaguely research-y experiments involving programming languages. 
 - [Minimal modern syntax](./minimal-modern-syntax) — Lispy minimalism meets prefix/infix/keyword calls
 - [Time loop maps](./time-loop-maps) — Programming with paradoxical loop values
 - [Flat stack lists](./flat-stack-lists) — Immutable lists entirely on the stack
+- [Flat stack closures](./flat-stack-closures/) - Closures entirely on the stack
