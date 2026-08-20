@@ -176,9 +176,11 @@ impl Vm {
         // pass 1: mark (bottom <- top)
         for sp in (floor..=ret).rev() {
             if self.stack[sp].meta.mark {
-                let r = self.resolve_slot(sp)?;
-                if r >= floor && r < sp {
-                    self.mark(r)?;
+                if let Ref { offset } = self.stack[sp].op {
+                    let r = sp.checked_sub(offset).ok_or(ERR_INVALID_REF)?;
+                    if r >= floor && r < sp {
+                        self.mark(r)?;
+                    }
                 }
             }
         }

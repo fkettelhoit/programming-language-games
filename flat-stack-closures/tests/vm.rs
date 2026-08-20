@@ -1,4 +1,4 @@
-use flat_stack_closures::{BinOp, Op, SizedOp, Vm};
+use flat_stack_closures::{BinOp, CallFrame, Op, SizedOp, Vm};
 use Op::*;
 use SizedOp::*;
 
@@ -1089,6 +1089,41 @@ fn stale_shift_below_floor() {
             Ref { offset: 1 }, // result[0] -> capture list (one too low if stale shift is read)
             Int(9),            // result[1]
             Sized(List { elems: 2 }, 5), // result — root, re-marked
+        ]
+    );
+}
+
+#[test]
+fn mark_pass_walks_over_unresolved_var() {
+    // The mark pass must treat a marked non-ref slot as opaque and walk on.
+    // Resolving it instead asserts the runtime invariant "no unresolved vars
+    // on the output stack" from inside the collector, which aborts compaction
+    // on any var it happens to mark — the shape comptime needs, where a
+    // returned value can still hold unresolved vars.
+    //
+    // No program can reach this: every copying path goes through `borrow`,
+    // which rejects `Var`, so the frame is built by hand. Slot 0 is the
+    // return instruction, the frame floors at 1, and the returned list is
+    // [var, 5] over three slots of garbage — residue 3 exceeds the value's
+    // extent 2, so the knob forces the passes instead of adopting.
+    let mut vm = Vm::load(vec![
+        Sized(FuncEnd { args: 0 }, 0), // 0  executed to return
+        Int(9),                        // 1  floor — garbage
+        Int(9),                        // 2  garbage
+        Int(9),                        // 3  garbage
+        Var { elem: 0 },               // 4  root[0] — marked, unresolved
+        Int(5),                        // 5  root[1]
+        Sized(List { elems: 2 }, 2),   // 6  root
+    ]);
+    vm.frames.push(CallFrame { floor: 1, base: 1, args: 1, ret: 7 });
+    assert_eq!(vm.run(), Ok(()));
+    assert_eq!(
+        vm.stack.into_iter().map(|slot| slot.op).collect::<Vec<_>>(),
+        [
+            Sized(FuncEnd { args: 0 }, 0), // the return instruction, below the floor
+            Var { elem: 0 },               // root[0] — copied through untouched
+            Int(5),                        // root[1]
+            Sized(List { elems: 2 }, 2),   // root, slid onto the floor
         ]
     );
 }
