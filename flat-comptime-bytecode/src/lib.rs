@@ -22,8 +22,8 @@ pub enum Op {
 pub enum SizedOp {
     BlobStart,
     BlobEnd,
-    FuncStart,
-    FuncEnd { args: usize },
+    FnStart,
+    FnEnd { args: usize },
     Call { args: usize, comptime: bool },
     List { elems: usize },
     Push { elems: usize },
@@ -54,7 +54,7 @@ impl From<Op> for Slot {
 impl Slot {
     fn size(&self) -> usize {
         match self.op {
-            Sized(BlobStart | BlobEnd | FuncStart | FuncEnd { .. }, slots) => slots + 2,
+            Sized(BlobStart | BlobEnd | FnStart | FnEnd { .. }, slots) => slots + 2,
             Sized(_, slots) => slots + 1,
             _ => 1,
         }
@@ -67,7 +67,7 @@ pub struct CallFrame {
     pub base: usize,
     pub args: usize,
     pub ret: Option<usize>,
-    pub is_symbolic: bool,
+    pub is_deferred: bool,
 }
 
 #[derive(Debug)]
@@ -84,7 +84,7 @@ const ERR_NO_CALL_FRAME: &str = "No active call frame";
 const ERR_NO_OP: &str = "No op at instruction pointer";
 const ERR_INVALID_ARITY: &str = "Arity mismatch";
 const ERR_INVALID_REF: &str = "Invalid ref offset";
-const ERR_INVALID_FUNC: &str = "Invalid function";
+const ERR_INVALID_FN: &str = "Invalid function";
 const ERR_INVALID_LIST: &str = "Invalid list";
 const ERR_INVALID_INT: &str = "Invalid int";
 const ERR_INT_OVERFLOW: &str = "Int overflow";
@@ -211,7 +211,7 @@ impl Vm {
         Ok(())
     }
 
-    fn needs_comptime(&self, slots: usize) -> Result<bool, &'static str> {
+    fn has_comptime(&self, slots: usize) -> Result<bool, &'static str> {
         let mut sp = self.ip + 1;
         while sp <= self.ip + slots {
             match self.op(sp)? {
@@ -223,19 +223,19 @@ impl Vm {
         return Ok(false);
     }
 
-    fn is_symbolic(&self) -> bool {
-        self.frames.last().map(|f| f.is_symbolic).unwrap_or(true)
-    }
-
     fn is_value(&self, sp: usize) -> Result<bool, &'static str> {
         Ok(match self.op(sp)? {
-            Int(_) | Sized(BlobEnd | FuncEnd { .. }, _) => true,
+            Int(_) | Sized(BlobEnd | FnEnd { .. }, _) => true,
             Sized(List { elems }, _) if self.sum_size(sp - 1, elems)? == elems => true,
             _ => false,
         })
     }
 
-    fn unresolved(&mut self, op: SizedOp, args: usize) -> Result<bool, &'static str> {
+    fn is_deferred(&self) -> bool {
+        self.frames.last().map(|f| f.is_deferred).unwrap_or(true)
+    }
+
+    fn defer(&mut self, op: SizedOp, args: usize) -> Result<bool, &'static str> {
         let mut sp = self.sp();
         let mut is_unresolved = false;
         let allow_vars = matches!(op, Call { .. });
@@ -256,8 +256,7 @@ impl Vm {
     }
 
     fn eval_once(&mut self, comptime: bool) -> Result<(), &'static str> {
-        let op = self.stack.get(self.ip).ok_or(ERR_NO_OP)?.op;
-        match op {
+        match self.stack.get(self.ip).copied().ok_or(ERR_NO_OP)?.op {
             Int(i) => {
                 self.push(Int(i));
                 self.ip += 1;
@@ -273,13 +272,13 @@ impl Vm {
                 self.push(self.borrow(self.resolve_var(elem)?, self.stack.len())?);
                 self.ip += 1;
             }
-            Sized(FuncStart, slots)
-                if comptime && self.is_symbolic() && self.needs_comptime(slots)? =>
+            Sized(FnStart, slots)
+                if comptime && self.is_deferred() && self.has_comptime(slots)? =>
             {
-                let Sized(FuncEnd { args }, _) = self.op(self.ip + 1 + slots)? else {
-                    return Err(ERR_INVALID_FUNC);
+                let Sized(FnEnd { args }, _) = self.op(self.ip + 1 + slots)? else {
+                    return Err(ERR_INVALID_FN);
                 };
-                self.push(Sized(FuncStart, 0 /* will be set at FuncEnd */));
+                self.push(Sized(FnStart, 0 /* will be set at FnEnd */));
                 let (floor, base, args) = if args == 0 {
                     match self.frames.last().copied() {
                         Some(CallFrame { base, args, .. }) => (self.stack.len(), base, args),
@@ -292,16 +291,15 @@ impl Vm {
                     let base = self.stack.len() - args;
                     (base, base, args)
                 };
-                let is_symbolic = true;
-                self.frames.push(CallFrame { floor, base, args, ret: None, is_symbolic });
+                self.frames.push(CallFrame { floor, base, args, ret: None, is_deferred: true });
                 self.ip += 1;
             }
-            Sized(FuncStart, slots) | Sized(BlobStart, slots) => {
+            Sized(FnStart, slots) | Sized(BlobStart, slots) => {
                 let offset = (self.sp() - self.ip).checked_sub(slots).ok_or(ERR_UNDERFLOW)?;
                 self.push(Ref { offset });
                 self.ip += slots + 2;
             }
-            Sized(FuncEnd { args, .. }, _) => {
+            Sized(FnEnd { args, .. }, _) => {
                 let CallFrame { floor, ret, .. } = self.frames.pop().ok_or(ERR_NO_CALL_FRAME)?;
                 let sp = self.sp();
                 let threatened = sp - floor;
@@ -324,16 +322,16 @@ impl Vm {
                     None => {
                         let slots = self.stack.len() - floor;
                         self.stack.get_mut(floor - 1).ok_or(ERR_UNDERFLOW)?.op =
-                            Sized(FuncStart, slots);
-                        self.push(Sized(FuncEnd { args }, slots));
+                            Sized(FnStart, slots);
+                        self.push(Sized(FnEnd { args }, slots));
                         self.ip += 1;
                     }
                 }
             }
             Sized(BlobEnd, _) => return Err(ERR_BLOB_END),
             Sized(op @ Call { args, comptime: _ }, _)
-                if comptime && self.unresolved(op, args + 1)? => {}
-            Sized(Call { args, comptime: false }, _) if comptime && self.is_symbolic() => {
+                if comptime && self.defer(op, args + 1)? => {}
+            Sized(Call { args, comptime: false }, _) if comptime && self.is_deferred() => {
                 let slots_args = self.sum_size(self.sp(), args)?;
                 let sp_op = self.sp() - slots_args;
                 let slots = slots_args + self.stack[sp_op].size();
@@ -348,8 +346,8 @@ impl Vm {
                 let sp_f = self.resolve_slot(sp_op)?;
                 let ret = Some(self.ip + 1);
                 match self.op(sp_f)? {
-                    Sized(FuncEnd { args: a }, _) if args != a => return Err(ERR_INVALID_ARITY),
-                    Sized(FuncEnd { .. }, slots_f) => {
+                    Sized(FnEnd { args: a }, _) if args != a => return Err(ERR_INVALID_ARITY),
+                    Sized(FnEnd { .. }, slots_f) => {
                         if slots_args > args {
                             self.push_borrows(sp_args, args)?;
                         }
@@ -359,16 +357,16 @@ impl Vm {
                             base: self.stack.len() - args,
                             args,
                             ret,
-                            is_symbolic: false,
+                            is_deferred: false,
                         });
                     }
                     Sized(List { elems }, _) if elems > 0 => {
                         let sp_code = self.resolve_slot(sp_f - elems)?;
                         match self.op(sp_code)? {
-                            Sized(FuncEnd { args: a }, _) if elems - 1 + args != a => {
+                            Sized(FnEnd { args: a }, _) if elems - 1 + args != a => {
                                 return Err(ERR_INVALID_ARITY);
                             }
-                            Sized(FuncEnd { .. }, slots_code) => {
+                            Sized(FnEnd { .. }, slots_code) => {
                                 self.push_borrows(sp_f - 1, elems - 1)?;
                                 self.push_borrows(sp_args, args)?;
                                 self.ip = sp_code - slots_code;
@@ -378,7 +376,7 @@ impl Vm {
                                     base: self.stack.len() - arity,
                                     args: arity,
                                     ret,
-                                    is_symbolic: false,
+                                    is_deferred: false,
                                 });
                             }
                             _ if comptime && !self.is_value(sp_code)? => {
@@ -388,17 +386,17 @@ impl Vm {
                                 ));
                                 self.ip += 1;
                             }
-                            _ => return Err(ERR_INVALID_FUNC),
+                            _ => return Err(ERR_INVALID_FN),
                         }
                     }
                     _ if comptime && !self.is_value(sp_f)? => {
                         self.push(Sized(Call { args, comptime: f_ct }, slots_args + slots_op));
                         self.ip += 1;
                     }
-                    _ => return Err(ERR_INVALID_FUNC),
+                    _ => return Err(ERR_INVALID_FN),
                 }
             }
-            Sized(op @ List { elems }, _) if comptime && self.unresolved(op, elems)? => {}
+            Sized(op @ List { elems }, _) if comptime && self.defer(op, elems)? => {}
             Sized(List { elems }, _) => {
                 let mut slots = self.sum_size(self.sp(), elems)?;
                 if slots > elems {
@@ -408,7 +406,7 @@ impl Vm {
                 self.push(Sized(List { elems }, slots));
                 self.ip += 1;
             }
-            Sized(op @ Push { elems }, _) if comptime && self.unresolved(op, elems + 1)? => {}
+            Sized(op @ Push { elems }, _) if comptime && self.defer(op, elems + 1)? => {}
             Sized(Push { elems: n }, _) => {
                 let sp = self.sp();
                 let slots_tail = self.sum_size(sp, n as usize)?;
@@ -423,7 +421,7 @@ impl Vm {
                 self.push(Sized(List { elems: elems + n as usize }, self.stack.len() - base));
                 self.ip += 1;
             }
-            Sized(op @ Set, _) if comptime && self.unresolved(op, 3)? => {}
+            Sized(op @ Set, _) if comptime && self.defer(op, 3)? => {}
             Sized(Set, _) => {
                 // TODO once direct mutation lands: Make sure it's impossible to create forward-refs
                 let Int(i) = self.op(self.sp())? else {
@@ -446,7 +444,7 @@ impl Vm {
                 self.push(Sized(List { elems }, self.stack.len() - base));
                 self.ip += 1;
             }
-            Sized(op @ Get, _) if comptime && self.unresolved(op, 2)? => {}
+            Sized(op @ Get, _) if comptime && self.defer(op, 2)? => {}
             Sized(Get, _) => {
                 let [.., _, i] = self.stack.as_slice() else {
                     return Err(ERR_UNDERFLOW);
@@ -491,7 +489,7 @@ impl Vm {
                 }
                 self.ip += 1;
             }
-            Sized(op @ If, _) if comptime && self.unresolved(op, 3)? => {}
+            Sized(op @ If, _) if comptime && self.defer(op, 3)? => {}
             Sized(If, _) => {
                 let cond = self.op(self.sp())?;
                 let Int(cond) = cond else {
@@ -503,20 +501,20 @@ impl Vm {
                 let sp_f = self.resolve_slot(f)?;
                 let sp_t = self.resolve_slot(t)?;
                 match (self.op(sp_t)?, self.op(sp_f)?) {
-                    (Sized(FuncEnd { args: a }, slots_t), Sized(FuncEnd { args: b }, slots_f)) => {
+                    (Sized(FnEnd { args: a }, slots_t), Sized(FnEnd { args: b }, slots_f)) => {
                         if a != 0 || b != 0 {
                             return Err(ERR_INVALID_ARITY);
                         }
-                        let CallFrame { base, args, is_symbolic, .. } =
+                        let CallFrame { base, args, is_deferred, .. } =
                             self.frames.last().copied().ok_or(ERR_NO_CALL_FRAME)?;
                         let ret = Some(self.ip + 1);
-                        self.frames.push(CallFrame { floor: t, base, args, ret, is_symbolic });
+                        self.frames.push(CallFrame { floor: t, base, args, ret, is_deferred });
                         self.ip = if cond == 0 { sp_f - slots_f } else { sp_t - slots_t };
                     }
-                    (_, _) => return Err(ERR_INVALID_FUNC),
+                    (_, _) => return Err(ERR_INVALID_FN),
                 }
             }
-            Sized(op @ Len, _) if comptime && self.unresolved(op, 1)? => {}
+            Sized(op @ Len, _) if comptime && self.defer(op, 1)? => {}
             Sized(Len, _) => {
                 let sp_op = self.resolve_slot(self.sp())?;
                 match self.op(sp_op)? {
@@ -532,7 +530,7 @@ impl Vm {
                 }
                 self.ip += 1;
             }
-            Sized(op @ Bin(_), _) if comptime && self.unresolved(op, 2)? => {}
+            Sized(op @ Bin(_), _) if comptime && self.defer(op, 2)? => {}
             Sized(Bin(op), _) => {
                 let [.., a, b] = self.stack.as_slice() else {
                     return Err(ERR_UNDERFLOW);
