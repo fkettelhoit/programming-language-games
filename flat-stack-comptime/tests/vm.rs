@@ -1,6 +1,6 @@
 use Op::*;
 use SizedOp::*;
-use flat_comptime_bytecode::{BinOp, Op, SizedOp, Vm};
+use flat_stack_comptime::{BinOp, Op, SizedOp, Vm};
 
 fn run(program: Vec<Op>, comptime: bool) -> Vec<Op> {
     let mut vm = Vm::load(program);
