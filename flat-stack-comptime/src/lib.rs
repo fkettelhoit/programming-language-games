@@ -154,7 +154,7 @@ impl Vm {
     }
 
     fn mark(&mut self, sp: usize) -> Result<(), &'static str> {
-        for sp in sp - self.stack[sp].size() + 1..=sp {
+        for sp in sp + 1 - self.stack[sp].size()..=sp {
             self.stack.get_mut(sp).ok_or(ERR_UNDERFLOW)?.meta.mark = true;
         }
         Ok(())
@@ -162,7 +162,8 @@ impl Vm {
 
     fn compact(&mut self, floor: usize) -> Result<(), &'static str> {
         // resolve the return value first
-        let ret = self.resolve_slot(self.sp())?;
+        let Some(top) = self.stack.len().checked_sub(1) else { return Ok(()) };
+        let ret = self.resolve_slot(top)?;
         match self.op(ret)? {
             Sized(List { elems: n }, _) if self.sum_size(ret - 1, n)? == n => {
                 for sp in ret - n..=ret {
@@ -559,6 +560,6 @@ impl Vm {
         while self.ip != self.end {
             self.eval_once(comptime)?;
         }
-        Ok(())
+        self.compact(0)
     }
 }

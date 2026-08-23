@@ -10,13 +10,6 @@ fn run(program: Vec<Op>, comptime: bool) -> Vec<Op> {
     vm.stack.into_iter().map(|slot| slot.op).collect()
 }
 
-/// Run and return only the working region (everything above the program prefix).
-fn values(program: Vec<Op>, comptime: bool) -> Vec<Op> {
-    let prefix = program.len();
-    let tape = run(program, comptime);
-    tape[prefix..].to_vec()
-}
-
 /// Reload `tape` as the next stage's program, call its topmost value with the
 /// given int args at runtime, and return the full resulting tape.
 fn reload_and_call(tape: Vec<Op>, args: &[i64]) -> Vec<Op> {
@@ -50,7 +43,7 @@ fn residual_call_is_measured_and_left_on_the_tape() {
     // Regression: the arm once forgot to advance ip (infinite loop), and once
     // measured only the args, so compaction collected the callee.
     assert_eq!(
-        values(vec![Int(1), Sized(Call { args: 0, comptime: false }, 0)], true),
+        run(vec![Int(1), Sized(Call { args: 0, comptime: false }, 0)], true),
         [Int(1), Sized(Call { args: 0, comptime: false }, 1)]
     );
 }
@@ -58,12 +51,14 @@ fn residual_call_is_measured_and_left_on_the_tape() {
 // --- comptime evaluation of function bodies ----------------------------------
 
 #[test]
-fn body_without_comptime_calls_stays_in_prefix() {
-    // A body containing no comptime calls is never re-emitted: its value is a
-    // handle into the prefix, exactly as at runtime.
+fn body_without_comptime_calls_is_left_alone() {
+    // A body containing no comptime calls is never re-emitted: walking it
+    // yields a handle to the untouched definition, exactly as at runtime.
+    // The stage's closing compaction then resolves that handle away, so the
+    // definition itself is all that survives.
     assert_eq!(
-        values(vec![Sized(FnStart, 1), Var { elem: 0 }, Sized(FnEnd { args: 1 }, 1)], true),
-        [Ref { offset: 1 }]
+        run(vec![Sized(FnStart, 1), Var { elem: 0 }, Sized(FnEnd { args: 1 }, 1)], true),
+        [Sized(FnStart, 1), Var { elem: 0 }, Sized(FnEnd { args: 1 }, 1)]
     );
 }
 
@@ -79,15 +74,9 @@ fn body_collapses_to_constant_two_args() {
         Sized(Call { args: 0, comptime: true }, 0), // 5
         Sized(FnEnd { args: 2 }, 2),                // 6
     ]);
-    assert_eq!(
-        values(prog, true),
-        [
-            Ref { offset: 5 }, // handle to g, still in the prefix
-            Sized(FnStart, 1),
-            Int(5),
-            Sized(FnEnd { args: 2 }, 1),
-        ]
-    );
+    // g is inlined and then collected by the stage's closing compaction:
+    // nothing references it any more.
+    assert_eq!(run(prog, true), [Sized(FnStart, 1), Int(5), Sized(FnEnd { args: 2 }, 1)]);
 }
 
 #[test]
@@ -101,10 +90,7 @@ fn body_collapses_to_constant_one_arg() {
         Sized(Call { args: 0, comptime: true }, 0), // 5
         Sized(FnEnd { args: 1 }, 2),                // 6
     ]);
-    assert_eq!(
-        values(prog, true),
-        [Ref { offset: 5 }, Sized(FnStart, 1), Int(5), Sized(FnEnd { args: 1 }, 1),]
-    );
+    assert_eq!(run(prog, true), [Sized(FnStart, 1), Int(5), Sized(FnEnd { args: 1 }, 1)]);
 }
 
 #[test]
@@ -127,9 +113,8 @@ fn body_with_vars_re_emits_them_in_place() {
         Sized(FnEnd { args: 1 }, 5),                // 9
     ]);
     assert_eq!(
-        values(prog, true),
+        run(prog, true),
         [
-            Ref { offset: 8 },
             Sized(FnStart, 4),
             Var { elem: 0 },
             Var { elem: 0 },
@@ -153,10 +138,7 @@ fn body_returning_its_own_var_re_brackets() {
         Var { elem: 0 },                            // 6
         Sized(FnEnd { args: 1 }, 3),                // 7
     ]);
-    assert_eq!(
-        values(prog, true),
-        [Ref { offset: 6 }, Sized(FnStart, 1), Var { elem: 0 }, Sized(FnEnd { args: 1 }, 1),]
-    );
+    assert_eq!(run(prog, true), [Sized(FnStart, 1), Var { elem: 0 }, Sized(FnEnd { args: 1 }, 1)]);
 }
 
 #[test]
@@ -172,17 +154,8 @@ fn top_level_thunk_with_comptime_call_walks() {
         Sized(Call { args: 0, comptime: true }, 0), // 5
         Sized(FnEnd { args: 0 }, 2),                // 6
     ]);
-    let prefix = prog.len();
     let stage1 = run(prog, true);
-    assert_eq!(
-        stage1[prefix..],
-        [
-            Ref { offset: 5 }, // handle to g, still in the prefix
-            Sized(FnStart, 1),
-            Int(5),
-            Sized(FnEnd { args: 0 }, 1),
-        ]
-    );
+    assert_eq!(stage1, [Sized(FnStart, 1), Int(5), Sized(FnEnd { args: 0 }, 1)]);
     assert_eq!(reload_and_call(stage1, &[]).last(), Some(&Int(5)));
 }
 
@@ -230,13 +203,12 @@ fn comptime_call_with_unresolved_arg_is_inlined() {
         Sized(Call { args: 1, comptime: true }, 0), // 8
         Sized(FnEnd { args: 1 }, 3),                // 9
     ];
-    let prefix = prog.len();
     let stage1 = run(prog, true);
     // the call to f is gone from the residual: f was applied at comptime
     assert!(
-        !stage1[prefix..].iter().any(|op| matches!(op, Sized(Call { .. }, _))),
+        !stage1.iter().any(|op| matches!(op, Sized(Call { .. }, _))),
         "expected no residual call, got {:?}",
-        &stage1[prefix..]
+        &stage1
     );
     // ... and the residual g2 still computes [y, 1]
     let tape = reload_and_call(stage1, &[7]);
@@ -269,12 +241,11 @@ fn nested_comptime_function_is_emitted_and_called_in_stage() {
         Sized(Call { args: 1, comptime: true }, 0), // 11
         Sized(FnEnd { args: 1 }, 8),                // 12
     ];
-    let prefix = prog.len();
     let stage1 = run(prog, true);
     assert!(
-        !stage1[prefix..].iter().any(|op| matches!(op, Sized(Call { .. }, _))),
+        !stage1.iter().any(|op| matches!(op, Sized(Call { .. }, _))),
         "expected no residual call, got {:?}",
-        &stage1[prefix..]
+        &stage1
     );
     let tape = reload_and_call(stage1, &[7]);
     let [.., a, b, Sized(List { elems: 2 }, _)] = tape[..] else {
@@ -313,13 +284,11 @@ fn returned_residual_bracket_round_trips() {
         Sized(FnEnd { args: 1 }, 4),                // 9
         Sized(FnEnd { args: 0 }, 6),                // 10 returns inner
     ];
-    let prefix = prog.len();
     let stage1 = run(prog, true);
     assert_eq!(
-        stage1[prefix..],
+        stage1,
         [
-            Ref { offset: 9 }, // handle to k, still in the prefix
-            Sized(FnStart, 5),
+            Sized(FnStart, 5), // k is inlined and then collected
             Sized(FnStart, 3), // re-emitted inner ...
             Var { elem: 0 },
             Int(5), // ... with k()! precomputed
@@ -375,15 +344,21 @@ fn blog_example_defers_to_the_inlined_conditional() {
         Sized(Call { args: 2, comptime: true }, 0), // 16
         Sized(FnEnd { args: 1 }, 4),                // 17
     ];
-    let prefix = prog.len();
     let stage1 = run(prog, true);
     assert_eq!(
-        stage1[prefix..],
+        stage1,
         [
-            Ref { offset: 7 }, // handle to f, still in the prefix
+            // f itself is collected; only the two arms the residual still
+            // references survive, lifted out of f's bracket
+            Sized(FnStart, 1),
+            Int(1),
+            Sized(FnEnd { args: 0 }, 1),
+            Sized(FnStart, 1),
+            Int(0),
+            Sized(FnEnd { args: 0 }, 1),
             Sized(FnStart, 6),
-            Ref { offset: 17 }, // then-arm handle
-            Ref { offset: 15 }, // else-arm handle
+            Ref { offset: 5 }, // then-arm handle
+            Ref { offset: 3 }, // else-arm handle
             Var { elem: 0 },
             Var { elem: 0 },
             Sized(Bin(BinOp::Eq), 2),
@@ -417,17 +392,19 @@ fn walked_arm_precomputes_its_comptime_call() {
         Sized(If, 0),                               // 14
         Sized(FnEnd { args: 1 }, 11),               // 15
     ]);
-    let prefix = prog.len();
     let stage1 = run(prog, true);
     assert_eq!(
-        stage1[prefix..],
+        stage1,
         [
-            Ref { offset: 14 }, // handle to g, still in the prefix
+            // the else-arm survives, lifted out of f's collected bracket
+            Sized(FnStart, 1),
+            Int(7),
+            Sized(FnEnd { args: 0 }, 1),
             Sized(FnStart, 8),
             Sized(FnStart, 1), // re-emitted then-arm ...
             Int(5),            // ... with g()! precomputed
             Sized(FnEnd { args: 0 }, 1),
-            Ref { offset: 11 }, // else-arm handle
+            Ref { offset: 5 }, // else-arm handle
             Var { elem: 0 },
             Int(0),
             Sized(Bin(BinOp::Eq), 2),
@@ -458,7 +435,7 @@ fn comptime_call_of_thunk_applies_runtime_calls_inside() {
         Ref { offset: 1 },                           // 10 -> f
         Sized(Call { args: 0, comptime: true }, 0),  // 11
     ];
-    assert_eq!(values(prog, true).last(), Some(&Int(18)));
+    assert_eq!(run(prog, true).last(), Some(&Int(18)));
 }
 
 /// countdown as a self-capturing closure: c = [code, code]; c(3), with the
@@ -544,16 +521,20 @@ fn deferred_call_in_a_list_round_trips() {
         Sized(List { elems: 2 }, 0),                 // 23
         Sized(FnEnd { args: 1 }, 15),                // 24
     ];
-    let prefix = prog.len();
     let stage1 = run(prog, true);
     assert_eq!(
-        stage1[prefix..],
+        stage1,
         [
-            Ref { offset: 23 }, // handle to g
-            Ref { offset: 19 }, // handle to h
+            // g is inlined and collected; h survives because the deferred
+            // call still references it
+            Sized(FnStart, 3),
+            Var { elem: 0 },
+            Int(2),
+            Sized(Bin(BinOp::Mul), 0),
+            Sized(FnEnd { args: 1 }, 3),
             Sized(FnStart, 5),
-            Int(5),             // g()! precomputed
-            Ref { offset: 22 }, // -> h
+            Int(5),            // g()! precomputed
+            Ref { offset: 3 }, // -> h
             Int(7),
             Sized(Call { args: 1, comptime: false }, 2), // h(7), deferred
             Sized(List { elems: 2 }, 4),                 // unnormalized list
@@ -593,12 +574,10 @@ fn compacted_list_return_drops_dead_bulk() {
         Sized(List { elems: 2 }, 0),                // 10
         Sized(FnEnd { args: 1 }, 7),                // 11
     ]);
-    let prefix = prog.len();
     let stage1 = run(prog, true);
     assert_eq!(
-        stage1[prefix..],
+        stage1,
         [
-            Ref { offset: 10 }, // handle to g
             Sized(FnStart, 6),
             Int(1),
             Int(2),
@@ -744,7 +723,7 @@ fn comptime_call_with_resolved_args_fully_evaluates() {
         Sized(List { elems: 2 }, 0),                // 7
         Sized(Call { args: 1, comptime: true }, 0), // 8
     ];
-    assert_eq!(values(prog, true).last(), Some(&Int(2)));
+    assert_eq!(run(prog, true).last(), Some(&Int(2)));
 }
 
 #[test]
@@ -787,6 +766,96 @@ fn deferred_set_round_trip() {
         panic!("expected a 1-element list, got {:?}", &tape[tape.len() - 2..]);
     };
     assert_eq!(a, Int(7));
+}
+
+// --- stage-boundary collection -----------------------------------------------
+
+/// `dead = fn(x) x + 1` and `live = fn(x) x * 2`, in that order.
+fn two_definitions() -> Vec<Op> {
+    vec![
+        Sized(FnStart, 3),           // 0 dead
+        Var { elem: 0 },             // 1
+        Int(1),                      // 2
+        Sized(Bin(BinOp::Add), 0),   // 3
+        Sized(FnEnd { args: 1 }, 3), // 4
+        Sized(FnStart, 3),           // 5 live
+        Var { elem: 0 },             // 6
+        Int(2),                      // 7
+        Sized(Bin(BinOp::Mul), 0),   // 8
+        Sized(FnEnd { args: 1 }, 3), // 9
+    ]
+}
+
+#[test]
+fn stage_collects_definitions_the_result_does_not_reach() {
+    // A comptime run compacts the whole tape on completion, rooted at the
+    // topmost value. Here that value is a handle to `live`, so `dead` is
+    // unreachable and goes away: the stage output is a shorter program, not
+    // just the same program with residual code appended.
+    let stage1 = run(two_definitions(), true);
+    assert_eq!(
+        stage1,
+        [
+            Sized(FnStart, 3),
+            Var { elem: 0 },
+            Int(2),
+            Sized(Bin(BinOp::Mul), 0),
+            Sized(FnEnd { args: 1 }, 3),
+        ]
+    );
+    assert_eq!(reload_and_call(stage1, &[21]).last(), Some(&Int(42)));
+}
+
+#[test]
+fn stage_keeps_everything_a_list_of_exports_reaches() {
+    // The root is a single value, so a stage that wants to export several
+    // things wraps them in a list — the same aggregation vehicle closures
+    // already use. Both definitions are then reachable and both survive.
+    let mut prog = two_definitions();
+    prog.extend([
+        Ref { offset: 6 },           // 10 -> dead
+        Ref { offset: 2 },           // 11 -> live
+        Sized(List { elems: 2 }, 0), // 12 exports = [dead, live]
+    ]);
+    let stage1 = run(prog, true);
+    assert_eq!(
+        stage1,
+        [
+            Sized(FnStart, 3),
+            Var { elem: 0 },
+            Int(1),
+            Sized(Bin(BinOp::Add), 0),
+            Sized(FnEnd { args: 1 }, 3),
+            Sized(FnStart, 3),
+            Var { elem: 0 },
+            Int(2),
+            Sized(Bin(BinOp::Mul), 0),
+            Sized(FnEnd { args: 1 }, 3),
+            Ref { offset: 6 },
+            Ref { offset: 2 },
+            // the list adopts the whole tape below it, which after collection
+            // is exactly what it references
+            Sized(List { elems: 2 }, 12),
+        ]
+    );
+    // reload, then exports[1](21) == 42
+    let mut stage2 = stage1;
+    let exports = stage2.len() - 1;
+    stage2.push(Ref { offset: stage2.len() - exports });
+    stage2.push(Int(1));
+    stage2.push(Sized(Get, 0));
+    stage2.push(Int(21));
+    stage2.push(Sized(Call { args: 1, comptime: false }, 0));
+    assert_eq!(run(stage2, false).last(), Some(&Int(42)));
+}
+
+#[test]
+fn empty_program_leaves_an_empty_tape() {
+    // A run ends by compacting the whole tape, and compaction reads the
+    // topmost slot — of which there is none here. Regression: `sp()`
+    // underflowed, so an empty program panicked instead of being a no-op.
+    assert!(run(vec![], false).is_empty());
+    assert!(run(vec![], true).is_empty());
 }
 
 // --- runtime smoke tests -----------------------------------------------------
