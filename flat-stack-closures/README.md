@@ -1,6 +1,6 @@
 # Flat stack closures - Closures entirely on the stack
 
-Instead of moving values onto the heap when they would outlive the stack as part of a closure, what if closures lived entirely on the stack, mark-and-compacted and with good locality?
+Instead of moving values onto the heap when they would outlive the stack as part of a closure, what if closures lived entirely on the stack, mark-and-compacted, with good locality?
 
 ## Motivation
 
@@ -26,12 +26,12 @@ The bytecode guarantees several important invariants:
 ### Unified bytecode
 
 ```
-// Ops are atomic integers/variables/references or dynamically sized operations
+// Ops are atomic ints/variables/references or dynamically sized
 pub enum Op {
     Int(i64),
     Var { elem: usize },
     Ref { offset: usize },
-    Sized(SizedOp, usize), // the size field allows O(1) access as output
+    Sized(SizedOp, usize), // the size field allows O(1) access
 }
 
 pub enum SizedOp {
@@ -90,7 +90,7 @@ Int(4)                   |
 List { elems: 3 }        /
 ```
 
-Note how `Int(3)` and `Int(4)` just get copied and thus leave garbage on the stack, which will be reclaimed by the mark-and-compact algorithm that runs on return. So let's look at that next.
+Note how `Int(3)` and `Int(4)` just get copied and thus leave garbage on the stack, which will be reclaimed by the mark-and-compact algorithm that runs on return.
 
 ### 2-pass mark-and-compact
 
@@ -103,7 +103,7 @@ Note how we need to keep track of how far data has been shifted _after_ we have 
 
 All of this makes garbage collection trivial. It runs on return (whenever the size of the threatened area minus return value exceeds the size of the return value, leading to amortized compaction for incremental garbage) and the entire function is short enough to fit in less than 50 lines of code.
 
-## Closures
+### Closures
 
 Given the above bytecode + mark-and-compact on return there's barely anything else needed in the VM, because closures end up being just a combination of lists and functions. The calling convention for functions on the stack is function first, then arguments from left to right, so that `f(a, b, c)` on the stack would be represented as `f, a, b, c, Call { args: 3 }`, with `f` and its arguments standing in for one or more stack slots.
 
