@@ -205,8 +205,10 @@ impl Vm {
             }
         }
         self.stack.truncate(ret + 1 - gap);
-        if let Slot { op: Sized(_, slots), .. } = self.stack.last_mut().ok_or(ERR_UNDERFLOW)? {
-            *slots = (ret - gap) - floor;
+        match self.stack.last_mut().ok_or(ERR_UNDERFLOW)? {
+            Slot { op: Sized(FnEnd { .. } | BlobEnd, _), .. } => {}
+            Slot { op: Sized(_, slots), .. } => *slots = (ret - gap) - floor,
+            _ => {}
         }
         Ok(())
     }

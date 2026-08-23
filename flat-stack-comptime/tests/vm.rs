@@ -283,6 +283,62 @@ fn nested_comptime_function_is_emitted_and_called_in_stage() {
     assert_eq!([a, b], [Int(7), Int(5)]);
 }
 
+#[test]
+fn returned_residual_bracket_round_trips() {
+    // make_adder = fn() fn(x) x + k()! — the canonical specializer: bake a
+    // comptime constant into a function and return it. The inner function
+    // captures nothing, so closure conversion leaves it a bare nested
+    // bracket, and its comptime call makes the walk re-emit it. The only
+    // difference from the test above is that the enclosing body *returns* the
+    // emitted bracket instead of calling it, which makes it the compacted
+    // return value.
+    //
+    // A bracket records a code extent, not an adoptable data zone: its size()
+    // is slots + 2, so compaction's closing extent patch — which computes the
+    // live slots below the marker — overcounts by the FnStart marker itself.
+    // Header and footer then disagree by one, and on reload Call sets ip one
+    // slot low, executes the FnStart as the body's first op and yields a
+    // dangling Ref instead of 12. Silent at both stages. Note the body itself
+    // is staged correctly; only the bracket around it is wrong.
+    let prog = vec![
+        Sized(FnStart, 1),                          // 0  k = fn() 5
+        Int(5),                                     // 1
+        Sized(FnEnd { args: 0 }, 1),                // 2
+        Sized(FnStart, 6),                          // 3  make_adder
+        Sized(FnStart, 4),                          // 4    inner = fn(x) x + k()!
+        Var { elem: 0 },                            // 5
+        Ref { offset: 4 },                          // 6    -> k
+        Sized(Call { args: 0, comptime: true }, 0), // 7
+        Sized(Bin(BinOp::Add), 0),                  // 8
+        Sized(FnEnd { args: 1 }, 4),                // 9
+        Sized(FnEnd { args: 0 }, 6),                // 10 returns inner
+    ];
+    let prefix = prog.len();
+    let stage1 = run(prog, true);
+    assert_eq!(
+        stage1[prefix..],
+        [
+            Ref { offset: 9 }, // handle to k, still in the prefix
+            Sized(FnStart, 5),
+            Sized(FnStart, 3), // re-emitted inner ...
+            Var { elem: 0 },
+            Int(5), // ... with k()! precomputed
+            Sized(Bin(BinOp::Add), 2),
+            Sized(FnEnd { args: 1 }, 3), // must agree with its FnStart
+            Sized(FnEnd { args: 0 }, 5),
+        ]
+    );
+    // reload, then make_adder()(7) == 12
+    let mut stage2 = stage1;
+    let f_end = stage2.len() - 1;
+    stage2.push(Ref { offset: stage2.len() - f_end });
+    stage2.push(Sized(Call { args: 0, comptime: false }, 0));
+    stage2.push(Int(7));
+    stage2.push(Sized(Call { args: 1, comptime: false }, 0));
+    let tape = run(stage2, false);
+    assert_eq!(tape.last(), Some(&Int(12)));
+}
+
 // --- the 2026/08/16 example --------------------------------------------------
 
 #[test]
@@ -563,18 +619,15 @@ fn compacted_list_return_drops_dead_bulk() {
 
 #[test]
 fn comptime_call_with_deferred_span_arg_round_trips() {
-    // KNOWN FAILING (see roadmap): outer(y) = f(h(y))! with h unannotated and
-    // f(x) = [x]. The argument to the comptime call is a deferred span (h's
-    // call residualizes during the walk), and the apply path normalizes it
-    // into a ref-to-computation: push_borrows turns the span into a Ref in
-    // f's arg slot, and f's body copies that ref into the residual list.
-    // After reload the span re-executes by APPLYING — its result lands on top
-    // of the stack — while the ref re-borrows its old target, which still
-    // holds the input Call op: the element dangles. Values are
-    // self-evaluating, computations are not, so no output ref may point at
-    // one; the call must defer (keeping its comptime flag) instead of
-    // applying. Once it does, the deferred call applies on reload and
-    // get(outer(9), 0) == h(9) == 18.
+    // outer(y) = f(h(y))! with h unannotated and f(x) = [x]. The argument to the comptime call is a
+    // deferred span (h's call residualizes during the walk), and the apply path normalizes it into
+    // a ref-to-computation: push_borrows turns the span into a Ref in f's arg slot, and f's body
+    // copies that ref into the residual list. After reload the span re-executes by APPLYING — its
+    // result lands on top of the stack — while the ref re-borrows its old target, which still holds
+    // the input Call op: the element dangles. Values are self-evaluating, computations are not, so
+    // no output ref may point at one; the call must defer (keeping its comptime flag) instead of
+    // applying. Once it does, the deferred call applies on reload and get(outer(9), 0) == h(9) ==
+    // 18.
     let prog = vec![
         Sized(FnStart, 3),                           // 0  h = fn(a) a * 2
         Var { elem: 0 },                             // 1
