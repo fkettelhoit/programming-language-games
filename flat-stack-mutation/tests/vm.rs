@@ -362,6 +362,349 @@ fn deferred_pop_round_trips() {
     assert_eq!(tape.last(), Some(&Int(9)));
 }
 
+// --- tail calls ----------------------------------------------------------------
+
+#[test]
+fn plain_tail_call_discharges_the_caller_frame() {
+    // f(x) = h(x) with the call in tail position: the caller's frame region is
+    // discharged before the jump, and h returns straight to f's caller.
+    // f(21) == 42.
+    let tape = run(
+        vec![
+            Sized(FnStart, 3),                           // 0  h = fn(a) a * 2
+            Var { elem: 0 },                             // 1
+            Int(2),                                      // 2
+            Sized(Bin(BinOp::Mul), 0),                   // 3
+            Sized(FnEnd { args: 1 }, 3),                 // 4
+            Sized(FnStart, 3),                           // 5  f = fn(x) h(x)
+            Ref { offset: 2 },                           // 6  -> h
+            Var { elem: 0 },                             // 7
+            Sized(Call { args: 1, comptime: false }, 0), // 8
+            Sized(FnEnd { args: 1 }, 3),                 // 9
+            Ref { offset: 1 },                           // 10 -> f
+            Int(21),                                     // 11
+            Sized(Call { args: 1, comptime: false }, 0), // 12
+        ],
+        false,
+    );
+    assert_eq!(tape.last(), Some(&Int(42)));
+}
+
+#[test]
+fn tail_call_with_empty_list_arg_keeps_it_intact() {
+    // f(x) = h(x, []) in tail position — after the discharge, the topmost
+    // surviving slot is the empty-list arg. The block discharge must not run
+    // gc_until's closing extent fixup, which would rewrite that header's
+    // slots into a bogus region-sized extent. h(a, b) = len(b) == 0.
+    let tape = run(
+        vec![
+            Sized(FnStart, 2),                           // 0  h = fn(a, b) len(b)
+            Var { elem: 1 },                             // 1
+            Sized(Len, 0),                               // 2
+            Sized(FnEnd { args: 2 }, 2),                 // 3
+            Sized(FnStart, 4),                           // 4  f = fn(x) h(x, [])
+            Ref { offset: 2 },                           // 5  -> h
+            Var { elem: 0 },                             // 6
+            Sized(List { elems: 0 }, 0),                 // 7
+            Sized(Call { args: 2, comptime: false }, 0), // 8
+            Sized(FnEnd { args: 1 }, 4),                 // 9
+            Ref { offset: 1 },                           // 10 -> f
+            Int(7),                                      // 11
+            Sized(Call { args: 1, comptime: false }, 0), // 12
+        ],
+        false,
+    );
+    assert_eq!(tape.last(), Some(&Int(0)));
+}
+
+/// f(x, c) = if c { h(x) } else { x } with h = fn(a) a * 2, called as f(21, c).
+fn tail_call_in_branch(c: i64) -> Vec<Op> {
+    vec![
+        Sized(FnStart, 3),                           // 0  h
+        Var { elem: 0 },                             // 1
+        Int(2),                                      // 2
+        Sized(Bin(BinOp::Mul), 0),                   // 3
+        Sized(FnEnd { args: 1 }, 3),                 // 4
+        Sized(FnStart, 10),                          // 5  f
+        Sized(FnStart, 3),                           // 6  then: h(x)
+        Ref { offset: 3 },                           // 7  -> h
+        Var { elem: 0 },                             // 8
+        Sized(Call { args: 1, comptime: false }, 0), // 9
+        Sized(FnEnd { args: 0 }, 3),                 // 10
+        Sized(FnStart, 1),                           // 11 else: x
+        Var { elem: 0 },                             // 12
+        Sized(FnEnd { args: 0 }, 1),                 // 13
+        Var { elem: 1 },                             // 14
+        Sized(If, 0),                                // 15
+        Sized(FnEnd { args: 2 }, 10),                // 16
+        Ref { offset: 1 },                           // 17 -> f
+        Int(21),                                     // 18
+        Int(c),                                      // 19
+        Sized(Call { args: 2, comptime: false }, 0), // 20
+    ]
+}
+
+#[test]
+fn tail_call_in_branch_collapses_the_frame_chain() {
+    // The call in the then-arm is followed by the branch thunk's FnEnd, whose
+    // join is f's own FnEnd: the collapse must retire both the If frame and
+    // f's frame, and h returns straight to f's caller.
+    assert_eq!(run(tail_call_in_branch(1), false).last(), Some(&Int(42)));
+}
+
+#[test]
+fn untaken_tail_branch_still_returns_plainly() {
+    assert_eq!(run(tail_call_in_branch(0), false).last(), Some(&Int(21)));
+}
+
+/// countdown as a self-capturing closure: c = [code, code]; c(n).
+fn countdown(n: i64) -> Vec<Op> {
+    vec![
+        Sized(FnStart, 16),                          // 0  fn(self, n)
+        Sized(FnStart, 1),                           // 1  then
+        Int(0),                                      // 2
+        Sized(FnEnd { args: 0 }, 1),                 // 3
+        Sized(FnStart, 7),                           // 4  else: self([self, self], n - 1)
+        Var { elem: 0 },                             // 5
+        Var { elem: 0 },                             // 6
+        Sized(List { elems: 2 }, 0),                 // 7
+        Var { elem: 1 },                             // 8
+        Int(1),                                      // 9
+        Sized(Bin(BinOp::Sub), 0),                   // 10
+        Sized(Call { args: 1, comptime: false }, 0), // 11
+        Sized(FnEnd { args: 0 }, 7),                 // 12
+        Var { elem: 1 },                             // 13
+        Int(0),                                      // 14
+        Sized(Bin(BinOp::Eq), 0),                    // 15
+        Sized(If, 0),                                // 16
+        Sized(FnEnd { args: 2 }, 16),                // 17
+        Ref { offset: 1 },                           // 18
+        Ref { offset: 2 },                           // 19
+        Sized(List { elems: 2 }, 0),                 // 20
+        Int(n),                                      // 21
+        Sized(Call { args: 1, comptime: false }, 0), // 22
+    ]
+}
+
+#[test]
+fn deep_tail_recursion_runs_in_constant_space() {
+    // The acceptance test for TCO: the recursive call goes through the
+    // closure arm (self-recursion is always closure-arm recursion here), and
+    // each iteration collapses the If frame plus the function frame and
+    // discharges the dying region. Vec::truncate never shrinks capacity, so
+    // the post-run capacities are peak watermarks: without the collapse this
+    // run needs ~8×10^4 stack slots and 2×10^4 frames.
+    let mut vm = Vm::load(countdown(10_000));
+    vm.run(false).expect("countdown(10_000)");
+    assert_eq!(vm.stack.last().map(|slot| slot.op), Some(Int(0)));
+    assert!(vm.stack.capacity() < 4096, "stack peaked at {}", vm.stack.capacity());
+    assert!(vm.frames.capacity() < 64, "frames peaked at {}", vm.frames.capacity());
+}
+
+#[test]
+fn tail_recursive_sum_accumulates() {
+    // sum(n, acc) = if n == 0 { acc } else { sum(n - 1, acc + n) } — the
+    // accumulator flows through the collapsed frames; sum(10_000) checks
+    // that per-iteration discharge keeps exactly the live args.
+    let tape = run(
+        vec![
+            Sized(FnStart, 19),                          // 0  fn(self, n, acc)
+            Sized(FnStart, 1),                           // 1  then
+            Var { elem: 2 },                             // 2
+            Sized(FnEnd { args: 0 }, 1),                 // 3
+            Sized(FnStart, 10),                          // 4  else
+            Var { elem: 0 },                             // 5
+            Var { elem: 0 },                             // 6
+            Sized(List { elems: 2 }, 0),                 // 7
+            Var { elem: 1 },                             // 8
+            Int(1),                                      // 9
+            Sized(Bin(BinOp::Sub), 0),                   // 10
+            Var { elem: 2 },                             // 11
+            Var { elem: 1 },                             // 12
+            Sized(Bin(BinOp::Add), 0),                   // 13
+            Sized(Call { args: 2, comptime: false }, 0), // 14
+            Sized(FnEnd { args: 0 }, 10),                // 15
+            Var { elem: 1 },                             // 16
+            Int(0),                                      // 17
+            Sized(Bin(BinOp::Eq), 0),                    // 18
+            Sized(If, 0),                                // 19
+            Sized(FnEnd { args: 3 }, 19),                // 20
+            Ref { offset: 1 },                           // 21
+            Ref { offset: 2 },                           // 22
+            Sized(List { elems: 2 }, 0),                 // 23
+            Int(10_000),                                 // 24
+            Int(0),                                      // 25
+            Sized(Call { args: 2, comptime: false }, 0), // 26
+        ],
+        false,
+    );
+    assert_eq!(tape.last(), Some(&Int(50_005_000)));
+}
+
+/// loop(l, i) = if i == 0 { l } else { loop(push(l, i), i - 1) }, then `tail`.
+fn list_accumulator(n: i64, tail: &[Op]) -> Vec<Op> {
+    let mut prog = vec![
+        Sized(FnStart, 19),                          // 0  fn(self, l, i)
+        Sized(FnStart, 1),                           // 1  then
+        Var { elem: 1 },                             // 2
+        Sized(FnEnd { args: 0 }, 1),                 // 3
+        Sized(FnStart, 10),                          // 4  else
+        Var { elem: 0 },                             // 5
+        Var { elem: 0 },                             // 6
+        Sized(List { elems: 2 }, 0),                 // 7
+        Var { elem: 1 },                             // 8
+        Var { elem: 2 },                             // 9
+        Sized(Push { elems: 1 }, 0),                 // 10
+        Var { elem: 2 },                             // 11
+        Int(1),                                      // 12
+        Sized(Bin(BinOp::Sub), 0),                   // 13
+        Sized(Call { args: 2, comptime: false }, 0), // 14
+        Sized(FnEnd { args: 0 }, 10),                // 15
+        Var { elem: 2 },                             // 16
+        Int(0),                                      // 17
+        Sized(Bin(BinOp::Eq), 0),                    // 18
+        Sized(If, 0),                                // 19
+        Sized(FnEnd { args: 3 }, 19),                // 20
+        Ref { offset: 1 },                           // 21
+        Ref { offset: 2 },                           // 22
+        Sized(List { elems: 2 }, 0),                 // 23
+        Sized(List { elems: 0 }, 0),                 // 24
+        Int(n),                                      // 25
+        Sized(Call { args: 2, comptime: false }, 0), // 26
+    ];
+    prog.extend_from_slice(tail);
+    prog
+}
+
+#[test]
+fn tail_recursive_list_accumulator_stays_linear() {
+    // Each iteration's copy-path push builds a fresh list in the dying frame;
+    // the outgoing arg borrows it, so the discharge must keep the new copy
+    // and drop the previous one. Peak stack is O(list), not O(iterations ×
+    // list) — the watermark distinguishes ~2.5k slots from ~500k.
+    let mut vm = Vm::load(list_accumulator(1000, &[Sized(Len, 0)]));
+    vm.run(false).expect("accumulator(1000)");
+    assert_eq!(vm.stack.last().map(|slot| slot.op), Some(Int(1000)));
+    assert!(vm.stack.capacity() < 16384, "stack peaked at {}", vm.stack.capacity());
+}
+
+#[test]
+fn list_accumulator_builds_in_push_order() {
+    // loop([], 3) == [3, 2, 1]: i counts down while push appends.
+    let tape = run(list_accumulator(3, &[Int(0), Sized(Get, 0)]), false);
+    assert_eq!(tape.last(), Some(&Int(3)));
+}
+
+#[test]
+fn tail_call_through_nested_ifs_collapses_the_chain() {
+    // f(x, c) = if c { if c { h(x) } else { x } } else { x } — the call in
+    // the innermost branch retires three frames at once: both If frames and
+    // f's own, since each ret in the chain points at the next FnEnd.
+    let tape = run(
+        vec![
+            Sized(FnStart, 3),                           // 0  h = fn(a) a * 2
+            Var { elem: 0 },                             // 1
+            Int(2),                                      // 2
+            Sized(Bin(BinOp::Mul), 0),                   // 3
+            Sized(FnEnd { args: 1 }, 3),                 // 4
+            Sized(FnStart, 17),                          // 5  f
+            Sized(FnStart, 10),                          // 6  outer then
+            Sized(FnStart, 3),                           // 7  inner then: h(x)
+            Ref { offset: 4 },                           // 8  -> h
+            Var { elem: 0 },                             // 9
+            Sized(Call { args: 1, comptime: false }, 0), // 10
+            Sized(FnEnd { args: 0 }, 3),                 // 11
+            Sized(FnStart, 1),                           // 12 inner else
+            Var { elem: 0 },                             // 13
+            Sized(FnEnd { args: 0 }, 1),                 // 14
+            Var { elem: 1 },                             // 15
+            Sized(If, 0),                                // 16
+            Sized(FnEnd { args: 0 }, 10),                // 17
+            Sized(FnStart, 1),                           // 18 outer else
+            Var { elem: 0 },                             // 19
+            Sized(FnEnd { args: 0 }, 1),                 // 20
+            Var { elem: 1 },                             // 21
+            Sized(If, 0),                                // 22
+            Sized(FnEnd { args: 2 }, 17),                // 23
+            Ref { offset: 1 },                           // 24 -> f
+            Int(21),                                     // 25
+            Int(1),                                      // 26
+            Sized(Call { args: 2, comptime: false }, 0), // 27
+        ],
+        false,
+    );
+    assert_eq!(tape.last(), Some(&Int(42)));
+}
+
+#[test]
+fn runtime_returned_closure_still_applies() {
+    // apply(make_adder(3), 4) == 7, ported from the old crate: the call
+    // inside apply is a tail call to a closure living below the floor.
+    let tape = run(
+        vec![
+            Sized(FnStart, 3),                           // 0  adder = fn(n, x) n + x
+            Var { elem: 0 },                             // 1
+            Var { elem: 1 },                             // 2
+            Sized(Bin(BinOp::Add), 0),                   // 3
+            Sized(FnEnd { args: 2 }, 3),                 // 4
+            Sized(FnStart, 3),                           // 5  make_adder = fn(n) [code, n]
+            Ref { offset: 2 },                           // 6
+            Var { elem: 0 },                             // 7
+            Sized(List { elems: 2 }, 0),                 // 8
+            Sized(FnEnd { args: 1 }, 3),                 // 9
+            Sized(FnStart, 3),                           // 10 apply = fn(g, x) g(x)
+            Var { elem: 0 },                             // 11
+            Var { elem: 1 },                             // 12
+            Sized(Call { args: 1, comptime: false }, 0), // 13
+            Sized(FnEnd { args: 2 }, 3),                 // 14
+            Ref { offset: 1 },                           // 15 -> apply
+            Ref { offset: 7 },                           // 16 -> make_adder
+            Int(3),                                      // 17
+            Sized(Call { args: 1, comptime: false }, 0), // 18
+            Int(4),                                      // 19
+            Sized(Call { args: 2, comptime: false }, 0), // 20
+        ],
+        false,
+    );
+    assert_eq!(tape.last(), Some(&Int(7)));
+}
+
+#[test]
+fn staged_countdown_reloads_and_runs_deep() {
+    // countdown with g!() baked into the base case: the definition is staged
+    // (the then-arm re-emits with the constant precomputed, the else-arm and
+    // If defer), and the residual tape's recursive call must be detected as a
+    // tail call at runtime with no emitter cooperation — depth 10^4 on staged
+    // code.
+    let mut prog = g();
+    prog.extend([
+        Sized(FnStart, 17),                          // 3  fn(self, n)
+        Sized(FnStart, 2),                           // 4  then: g!()
+        Ref { offset: 3 },                           // 5  -> g
+        Sized(Call { args: 0, comptime: true }, 0),  // 6
+        Sized(FnEnd { args: 0 }, 2),                 // 7
+        Sized(FnStart, 7),                           // 8  else
+        Var { elem: 0 },                             // 9
+        Var { elem: 0 },                             // 10
+        Sized(List { elems: 2 }, 0),                 // 11
+        Var { elem: 1 },                             // 12
+        Int(1),                                      // 13
+        Sized(Bin(BinOp::Sub), 0),                   // 14
+        Sized(Call { args: 1, comptime: false }, 0), // 15
+        Sized(FnEnd { args: 0 }, 7),                 // 16
+        Var { elem: 1 },                             // 17
+        Int(0),                                      // 18
+        Sized(Bin(BinOp::Eq), 0),                    // 19
+        Sized(If, 0),                                // 20
+        Sized(FnEnd { args: 2 }, 17),                // 21
+        Ref { offset: 1 },                           // 22
+        Ref { offset: 2 },                           // 23
+        Sized(List { elems: 2 }, 0),                 // 24
+    ]);
+    let stage1 = run(prog, true);
+    assert_eq!(reload_and_call(stage1, &[10_000]).last(), Some(&Int(5)));
+}
+
 // --- take and moved ------------------------------------------------------------
 
 #[test]

@@ -45,6 +45,8 @@ pub enum BinOp {
     Mul,
 }
 
+use std::ops::Range;
+
 use Op::*;
 use SizedOp::*;
 
@@ -166,20 +168,9 @@ impl Vm {
         Ok(())
     }
 
-    fn compact(&mut self, floor: usize) -> Result<(), &'static str> {
-        // resolve the return value first
-        let Some(top) = self.stack.len().checked_sub(1) else { return Ok(()) };
-        let ret = self.resolve_slot(top)?;
-        match self.op(ret)? {
-            Sized(List { elems: n }, _) if self.sum_size(ret - 1, n)? == n => {
-                for sp in ret - n..=ret {
-                    self.stack.get_mut(sp).ok_or(ERR_UNDERFLOW)?.meta.mark = true;
-                }
-            }
-            _ => self.mark(ret)?,
-        }
-        // pass 1: mark (bottom <- top)
-        for sp in (floor..=ret).rev() {
+    fn mark_and_compact(&mut self, floor: usize, top: usize) -> Result<usize, &'static str> {
+        // pass 1: mark (floor <- top)
+        for sp in (floor..=top).rev() {
             if self.stack[sp].meta.mark {
                 if let Ref { offset } = self.stack[sp].op {
                     let r = sp.checked_sub(offset).ok_or(ERR_INVALID_REF)?;
@@ -189,9 +180,9 @@ impl Vm {
                 }
             }
         }
-        // pass 2: compact (bottom -> top)
+        // pass 2: compact (floor -> top)
         let mut gap = 0;
-        for sp in floor..=ret {
+        for sp in floor..=top {
             let mut slot = self.stack[sp];
             if slot.meta.mark {
                 if let Ref { offset } = slot.op {
@@ -211,6 +202,32 @@ impl Vm {
                 gap += 1;
             }
         }
+        Ok(gap)
+    }
+
+    fn gc_block(&mut self, range: Range<usize>, track: usize) -> Result<usize, &'static str> {
+        for sp in range.end..=self.sp() {
+            self.stack[sp].meta.mark = true;
+        }
+        let gap = self.mark_and_compact(range.start, self.sp())?;
+        let track = if track >= range.start { track - self.stack[track].meta.shift } else { track };
+        self.stack.truncate(self.stack.len() - gap);
+        Ok(track)
+    }
+
+    fn gc_until(&mut self, floor: usize) -> Result<(), &'static str> {
+        // resolve the return value first
+        let Some(top) = self.stack.len().checked_sub(1) else { return Ok(()) };
+        let ret = self.resolve_slot(top)?;
+        match self.op(ret)? {
+            Sized(List { elems: n }, _) if self.sum_size(ret - 1, n)? == n => {
+                for sp in ret - n..=ret {
+                    self.stack.get_mut(sp).ok_or(ERR_UNDERFLOW)?.meta.mark = true;
+                }
+            }
+            _ => self.mark(ret)?,
+        }
+        let gap = self.mark_and_compact(floor, ret)?;
         self.stack.truncate(ret + 1 - gap);
         match self.stack.last_mut().ok_or(ERR_UNDERFLOW)? {
             Slot { op: Sized(FnEnd { .. } | BlobEnd, _), .. } => {}
@@ -218,6 +235,22 @@ impl Vm {
             _ => {}
         }
         Ok(())
+    }
+
+    fn pop_tail_frames(&mut self) -> Result<CallFrame, &'static str> {
+        let mut f = self.frames.pop().ok_or(ERR_NO_CALL_FRAME)?;
+        while let Some(r) = f.ret {
+            if !matches!(self.op(r), Ok(Sized(FnEnd { .. }, _))) {
+                break;
+            }
+            match self.frames.last() {
+                Some(g) if g.ret.is_some() && !g.is_deferred => {
+                    f = self.frames.pop().ok_or(ERR_NO_CALL_FRAME)?;
+                }
+                _ => break,
+            }
+        }
+        Ok(f)
     }
 
     fn has_comptime(&self, slots: usize) -> Result<bool, &'static str> {
@@ -341,7 +374,7 @@ impl Vm {
                     Sized(List { elems }, slots) if !comptime && threatened - slots <= slots => {
                         self.stack[sp].op = Sized(List { elems }, sp - floor);
                     }
-                    _ => self.compact(floor)?,
+                    _ => self.gc_until(floor)?,
                 }
                 match ret {
                     Some(ret) => self.ip = ret,
@@ -371,22 +404,32 @@ impl Vm {
                 let slots_op = self.stack[sp_op].size();
                 let sp_f = self.resolve_slot(sp_op)?;
                 let ret = Some(self.ip + 1);
-                match self.op(sp_f)? {
-                    Sized(FnEnd { args: a }, _) if args != a => return Err(ERR_INVALID_ARITY),
-                    Sized(FnEnd { .. }, slots_f) => {
+                match (self.op(sp_f)?, self.op(self.ip + 1)?) {
+                    (Sized(FnEnd { args: a }, _), _) if args != a => return Err(ERR_INVALID_ARITY),
+                    (Sized(FnEnd { .. }, slots_f), _) => {
                         if slots_args > args {
                             self.push_borrows(sp_args, args)?;
                         }
+                        let (sp_f, frame) = match (self.op(self.ip + 1)?, self.frames.last()) {
+                            (Sized(FnEnd { .. }, _), Some(frame))
+                                if !comptime && !frame.is_deferred =>
+                            {
+                                let frame = self.pop_tail_frames()?;
+                                let sp_f =
+                                    self.gc_block(frame.floor..sp_op - slots_op + 1, sp_f)?;
+                                (sp_f, CallFrame { base: self.stack.len() - args, args, ..frame })
+                            }
+                            _ => {
+                                let base = self.stack.len() - args;
+                                let floor = sp_op - slots_op + 1;
+                                let is_deferred = false;
+                                (sp_f, CallFrame { floor, base, args, ret, is_deferred })
+                            }
+                        };
+                        self.frames.push(frame);
                         self.ip = sp_f.checked_sub(slots_f).ok_or(ERR_UNDERFLOW)?;
-                        self.frames.push(CallFrame {
-                            floor: sp_op - slots_op + 1,
-                            base: self.stack.len() - args,
-                            args,
-                            ret,
-                            is_deferred: false,
-                        });
                     }
-                    Sized(List { elems }, _) if elems > 0 => {
+                    (Sized(List { elems }, _), _) if elems > 0 => {
                         // closure = [FnEnd, <arg0>, <arg1>, ...]
                         let sp_code = self.resolve_slot(sp_f - elems)?;
                         match self.op(sp_code)? {
@@ -396,15 +439,37 @@ impl Vm {
                             Sized(FnEnd { .. }, slots_code) => {
                                 self.push_borrows(sp_f - 1, elems - 1)?;
                                 self.push_borrows(sp_args, args)?;
-                                self.ip = sp_code - slots_code;
                                 let arity = elems - 1 + args;
-                                self.frames.push(CallFrame {
-                                    floor: sp_op - slots_op + 1,
-                                    base: self.stack.len() - arity,
-                                    args: arity,
-                                    ret,
-                                    is_deferred: false,
-                                });
+                                let (sp_code, frame) =
+                                    match (self.op(self.ip + 1)?, self.frames.last()) {
+                                        (Sized(FnEnd { .. }, _), Some(frame))
+                                            if !comptime && !frame.is_deferred =>
+                                        {
+                                            let frame = self.pop_tail_frames()?;
+                                            let sp_code = self.gc_block(
+                                                frame.floor..sp_op - slots_op + 1,
+                                                sp_code,
+                                            )?;
+                                            let frame = CallFrame {
+                                                base: self.stack.len() - arity,
+                                                args: arity,
+                                                ..frame
+                                            };
+                                            (sp_code, frame)
+                                        }
+                                        _ => {
+                                            let frame = CallFrame {
+                                                floor: sp_op - slots_op + 1,
+                                                base: self.stack.len() - arity,
+                                                args: arity,
+                                                ret,
+                                                is_deferred: false,
+                                            };
+                                            (sp_code, frame)
+                                        }
+                                    };
+                                self.frames.push(frame);
+                                self.ip = sp_code.checked_sub(slots_code).ok_or(ERR_UNDERFLOW)?;
                             }
                             _ if comptime && !self.is_value(sp_code)? => {
                                 self.push(Sized(
@@ -446,6 +511,7 @@ impl Vm {
                 self.push_borrows(sp, n as usize)?;
                 let base = if sp_list == sp_op { sp_list - slots_old } else { sp_op };
                 self.push(Sized(List { elems: elems + n as usize }, self.stack.len() - base));
+                self.stack[sp_op].op = Moved;
                 self.ip += 1;
             }
             Sized(op @ Pop { .. }, _) if comptime && self.defer(op, 1)? => {}
@@ -468,6 +534,7 @@ impl Vm {
                 }
                 self.push_borrows(sp_list - 1, n)?;
                 self.push(Sized(List { elems: n + 1 }, self.stack.len() - base));
+                self.stack[sp_op].op = Moved;
                 self.ip += 1;
             }
             Sized(op @ Set, _) if comptime && self.defer(op, 3)? => {}
@@ -491,6 +558,7 @@ impl Vm {
                 self.stack[sp_i] = self.borrow(sp_elem, sp_i)?.into();
                 let base = if sp_list == sp_op { sp_list - slots_old } else { sp_op };
                 self.push(Sized(List { elems }, self.stack.len() - base));
+                self.stack[sp_op].op = Moved;
                 self.ip += 1;
             }
             Sized(op @ Get, _) if comptime && self.defer(op, 2)? => {}
@@ -527,7 +595,7 @@ impl Vm {
                         Ref { offset } => {
                             let sp_ref = self.sp();
                             self.stack[sp_ref].op = Ref { offset: sp_ref - (sp_elem - offset) };
-                            self.compact(base)?;
+                            self.gc_until(base)?;
                         }
                         s @ Sized(List { elems: 0 }, 0) => {
                             self.stack.truncate(base);
@@ -606,6 +674,6 @@ impl Vm {
         while self.ip != self.end {
             self.eval_once(comptime)?;
         }
-        self.compact(0)
+        self.gc_until(0)
     }
 }
