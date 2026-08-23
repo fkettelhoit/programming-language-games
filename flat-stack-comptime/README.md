@@ -25,7 +25,7 @@ f(x) = {
 f!(y)
 ```
 
-Without knowing what `y` is bound to, we can see that in the comptime call `f(y)!` both `x` and `y` resolve to the same value, so we could simplify the function call to a concrete if-else expression at comptime and drop the entire function definition of `f` from the runtime bytecode if the function isn't used anywhere else.
+Without knowing what `y` is bound to, we can see that in the comptime call `!f(y)` both `x` and `y` resolve to the same value, so we could simplify the function call to a concrete if-else expression at comptime and drop the entire function definition of `f` from the runtime bytecode if the function isn't used anywhere else.
 
 But to do that, we need to give our VM the ability to operate on _unresolved_ variables such as `y` at comptime. We cannot guarantee that variables are fully resolved before arguments are passed into a function, which means that the bytecode VM needs to evaluate comptime calls when possible but defer the remaining calls until runtime.
 
@@ -147,7 +147,7 @@ Going back to the initial example of comptime evaluating `f`, here's how the byt
  9    Bin(Eq)
 10    If
 11  FnEnd{2}(10)
-12  FnStart(4)         outer = (y) => f(y, y)!
+12  FnStart(4)         outer = (y) => f!(y, y)
 13    Ref -----> 11       -> f
 14    Var{0}
 15    Var{0}

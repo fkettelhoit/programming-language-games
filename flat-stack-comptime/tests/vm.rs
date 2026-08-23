@@ -64,7 +64,7 @@ fn body_without_comptime_calls_is_left_alone() {
 
 #[test]
 fn body_collapses_to_constant_two_args() {
-    // f(x, y) = g()! — the call to g runs at comptime and the residual f is a
+    // f(x, y) = g!() — the call to g runs at comptime and the residual f is a
     // constant function. Regression: re-bracketing paniced for args > 1 when
     // the return fast path had truncated the var slots.
     let mut prog = g();
@@ -95,7 +95,7 @@ fn body_collapses_to_constant_one_arg() {
 
 #[test]
 fn body_with_vars_re_emits_them_in_place() {
-    // f(x) = [x, x, g()!] — parameters are copied through as Var ops (vars are
+    // f(x) = [x, x, g!()] — parameters are copied through as Var ops (vars are
     // atoms) and stay inside their bracket, so the residual needs no ref->var
     // rewrite and no shifting. Regression: vars were once borrowed as refs to
     // the scaffold slots, which dangled after re-bracketing.
@@ -127,7 +127,7 @@ fn body_with_vars_re_emits_them_in_place() {
 
 #[test]
 fn body_returning_its_own_var_re_brackets() {
-    // f(x) = { g()!; x } — the result is an unresolved var. Regression: the
+    // f(x) = { g!(); x } — the result is an unresolved var. Regression: the
     // compact path resolved the return value through the var and failed with
     // "Unresolved var on the output stack"; vars must be atomic return values.
     let mut prog = g();
@@ -143,7 +143,7 @@ fn body_returning_its_own_var_re_brackets() {
 
 #[test]
 fn top_level_thunk_with_comptime_call_walks() {
-    // thunk = fn() g()! defined at the top level: the 0-arg bracket inherits
+    // thunk = fn() g!() defined at the top level: the 0-arg bracket inherits
     // its frame from the enclosing one, but at the top level there is none —
     // the fallback is an empty frame (no vars are in scope). Regression: this
     // used to fail with "No active call frame".
@@ -165,7 +165,7 @@ fn top_level_thunk_with_comptime_call_walks() {
 fn residual_function_round_trip() {
     // The definitional property of the experiment: the comptime output tape is
     // a valid input tape, and the residual function computes the same result
-    // as the original would have. f(x) = [x, x, g()!], then f(7) at runtime.
+    // as the original would have. f(x) = [x, x, g!()], then f(7) at runtime.
     let mut prog = g();
     prog.extend([
         Sized(FnStart, 5),                          // 3  f
@@ -186,7 +186,7 @@ fn residual_function_round_trip() {
 
 #[test]
 fn comptime_call_with_unresolved_arg_is_inlined() {
-    // The mechanism from notes/2026/08/16: g2(y) = f(y)! with f(x) = [x, 1]
+    // The mechanism from notes/2026/08/16: g2(y) = f!(y) with f(x) = [x, 1]
     // and y unresolved at comptime. f's arg slot holds the op Var{0}, every
     // use of x copies it through (substitution by value), f's frame dissolves,
     // and the copied var lands back inside g2's bracket, still naming elem 0 —
@@ -197,7 +197,7 @@ fn comptime_call_with_unresolved_arg_is_inlined() {
         Int(1),                                     // 2
         Sized(List { elems: 2 }, 0),                // 3
         Sized(FnEnd { args: 1 }, 3),                // 4
-        Sized(FnStart, 3),                          // 5  g2 = fn(y) f(y)!
+        Sized(FnStart, 3),                          // 5  g2 = fn(y) f!(y)
         Ref { offset: 2 },                          // 6  -> f
         Var { elem: 0 },                            // 7
         Sized(Call { args: 1, comptime: true }, 0), // 8
@@ -220,7 +220,7 @@ fn comptime_call_with_unresolved_arg_is_inlined() {
 
 #[test]
 fn nested_comptime_function_is_emitted_and_called_in_stage() {
-    // g3(y) = { inner(z) = [z, k()!]; inner(y)! } — inner is re-emitted onto
+    // g3(y) = { inner(z) = [z, k!()]; inner!(y) } — inner is re-emitted onto
     // the stack (its body contains a comptime call), and the comptime call to
     // inner then jumps into that freshly emitted bracket: code above the
     // original program prefix executes, which the unified representation
@@ -256,7 +256,7 @@ fn nested_comptime_function_is_emitted_and_called_in_stage() {
 
 #[test]
 fn returned_residual_bracket_round_trips() {
-    // make_adder = fn() fn(x) x + k()! — the canonical specializer: bake a
+    // make_adder = fn() fn(x) x + k!() — the canonical specializer: bake a
     // comptime constant into a function and return it. The inner function
     // captures nothing, so closure conversion leaves it a bare nested
     // bracket, and its comptime call makes the walk re-emit it. The only
@@ -276,7 +276,7 @@ fn returned_residual_bracket_round_trips() {
         Int(5),                                     // 1
         Sized(FnEnd { args: 0 }, 1),                // 2
         Sized(FnStart, 6),                          // 3  make_adder
-        Sized(FnStart, 4),                          // 4    inner = fn(x) x + k()!
+        Sized(FnStart, 4),                          // 4    inner = fn(x) x + k!()
         Var { elem: 0 },                            // 5
         Ref { offset: 4 },                          // 6    -> k
         Sized(Call { args: 0, comptime: true }, 0), // 7
@@ -291,7 +291,7 @@ fn returned_residual_bracket_round_trips() {
             Sized(FnStart, 5), // k is inlined and then collected
             Sized(FnStart, 3), // re-emitted inner ...
             Var { elem: 0 },
-            Int(5), // ... with k()! precomputed
+            Int(5), // ... with k!() precomputed
             Sized(Bin(BinOp::Add), 2),
             Sized(FnEnd { args: 1 }, 3), // must agree with its FnStart
             Sized(FnEnd { args: 0 }, 5),
@@ -315,7 +315,7 @@ fn blog_example_defers_to_the_inlined_conditional() {
     // The full example from notes/2026/08/16, closure-converted:
     //
     //   f(x, y') = if (x == y') { 1 } else { 0 }
-    //   outer(y) = f(y, y)!
+    //   outer(y) = f!(y, y)
     //
     // Substitution links x and y': both of f's arg slots hold the same op
     // Var{0}. By design, comptime and runtime agree, so Eq does not decide
@@ -372,14 +372,14 @@ fn blog_example_defers_to_the_inlined_conditional() {
 
 #[test]
 fn walked_arm_precomputes_its_comptime_call() {
-    // f(x) = if (x == 0) { g()! } else { 7 } — walking f's definition walks
-    // the then-arm (it contains a comptime call), precomputes g()! to 5, and
+    // f(x) = if (x == 0) { g!() } else { 7 } — walking f's definition walks
+    // the then-arm (it contains a comptime call), precomputes g!() to 5, and
     // re-emits the arm as a bracket; the condition and the If defer. The
     // residual still branches correctly at runtime.
     let mut prog = g();
     prog.extend([
         Sized(FnStart, 11),                         // 3  f
-        Sized(FnStart, 2),                          // 4  then: g()!
+        Sized(FnStart, 2),                          // 4  then: g!()
         Ref { offset: 3 },                          // 5  -> g
         Sized(Call { args: 0, comptime: true }, 0), // 6
         Sized(FnEnd { args: 0 }, 2),                // 7
@@ -402,7 +402,7 @@ fn walked_arm_precomputes_its_comptime_call() {
             Sized(FnEnd { args: 0 }, 1),
             Sized(FnStart, 8),
             Sized(FnStart, 1), // re-emitted then-arm ...
-            Int(5),            // ... with g()! precomputed
+            Int(5),            // ... with g!() precomputed
             Sized(FnEnd { args: 0 }, 1),
             Ref { offset: 5 }, // else-arm handle
             Var { elem: 0 },
@@ -418,7 +418,7 @@ fn walked_arm_precomputes_its_comptime_call() {
 
 #[test]
 fn comptime_call_of_thunk_applies_runtime_calls_inside() {
-    // f = fn() h(9), called as f()! — inside an applied comptime call,
+    // f = fn() h(9), called as f!() — inside an applied comptime call,
     // unannotated calls execute (the reverse-via-fold case), including for
     // zero-arg functions.
     let prog = vec![
@@ -470,7 +470,7 @@ fn countdown(comptime_rec: bool) -> Vec<Op> {
 
 #[test]
 fn comptime_recursion_with_annotated_call_evaluates() {
-    // countdown(3)! with the recursive call also annotated: processing the
+    // countdown!(3) with the recursive call also annotated: processing the
     // definition defers the recursive call (its closure's code element is an
     // unresolved var), and the top-level application then runs the recursion
     // lazily through If, terminating via the base case exactly as at runtime.
@@ -489,7 +489,7 @@ fn comptime_recursion_with_plain_call_evaluates() {
 
 #[test]
 fn deferred_call_in_a_list_round_trips() {
-    // f(x) = [g()!, if (1 == 1) { h(7) } else { 0 }] — the condition is
+    // f(x) = [g!(), if (1 == 1) { h(7) } else { 0 }] — the condition is
     // static, so the If disappears at comptime and the unannotated h(7)
     // survives as a deferred call. The list containing it must stay
     // unnormalized: a handle to a deferred span would dangle after reload,
@@ -533,7 +533,7 @@ fn deferred_call_in_a_list_round_trips() {
             Sized(Bin(BinOp::Mul), 0),
             Sized(FnEnd { args: 1 }, 3),
             Sized(FnStart, 5),
-            Int(5),            // g()! precomputed
+            Int(5),            // g!() precomputed
             Ref { offset: 3 }, // -> h
             Int(7),
             Sized(Call { args: 1, comptime: false }, 2), // h(7), deferred
@@ -555,7 +555,7 @@ fn deferred_call_in_a_list_round_trips() {
 
 #[test]
 fn compacted_list_return_drops_dead_bulk() {
-    // f(x) = { g()!; [[1, 2], 3] } — normalizing the outer list copies Int(3)
+    // f(x) = { g!(); [[1, 2], 3] } — normalizing the outer list copies Int(3)
     // up as a handle, leaving a dead bulk copy inside the marker's extent.
     // Compaction on the symbolic return must use precise element marking for
     // a normalized list (elements are one slot each) so the dead copy is
@@ -598,7 +598,7 @@ fn compacted_list_return_drops_dead_bulk() {
 
 #[test]
 fn comptime_call_with_deferred_span_arg_round_trips() {
-    // outer(y) = f(h(y))! with h unannotated and f(x) = [x]. The argument to the comptime call is a
+    // outer(y) = f!(h(y)) with h unannotated and f(x) = [x]. The argument to the comptime call is a
     // deferred span (h's call residualizes during the walk), and the apply path normalizes it into
     // a ref-to-computation: push_borrows turns the span into a Ref in f's arg slot, and f's body
     // copies that ref into the residual list. After reload the span re-executes by APPLYING — its
@@ -617,7 +617,7 @@ fn comptime_call_with_deferred_span_arg_round_trips() {
         Var { elem: 0 },                             // 6
         Sized(List { elems: 1 }, 0),                 // 7
         Sized(FnEnd { args: 1 }, 2),                 // 8
-        Sized(FnStart, 5),                           // 9  outer = fn(y) f(h(y))!
+        Sized(FnStart, 5),                           // 9  outer = fn(y) f!(h(y))
         Ref { offset: 2 },                           // 10 -> f
         Ref { offset: 7 },                           // 11 -> h
         Var { elem: 0 },                             // 12
@@ -642,7 +642,7 @@ fn comptime_call_with_deferred_span_arg_round_trips() {
 
 #[test]
 fn deferred_ops_chain() {
-    // f(x) = { g()!; (x + 1) + 1 } — the inner Bin defers on the unresolved
+    // f(x) = { g!(); (x + 1) + 1 } — the inner Bin defers on the unresolved
     // var, and the outer Bin must recognize the residual Bin span as a
     // deferred computation and defer too: computations are contagious.
     let mut prog = g();
@@ -709,7 +709,7 @@ fn deferred_push_onto_unresolved_list() {
 
 #[test]
 fn comptime_call_with_resolved_args_fully_evaluates() {
-    // f(xs) = len(xs), called as f([1, 2])! — a borrowed operand that
+    // f(xs) = len(xs), called as f!([1, 2]) — a borrowed operand that
     // resolves to a value is not unresolved: the op evaluates and the whole
     // comptime call collapses to 2 on the tape.
     let prog = vec![
