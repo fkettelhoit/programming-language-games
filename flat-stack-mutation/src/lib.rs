@@ -12,8 +12,10 @@ pub struct Meta {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Op {
+    Moved,
     Int(i64),
     Var { elem: usize },
+    Take { elem: usize },
     Ref { offset: usize },
     Sized(SizedOp, usize),
 }
@@ -91,6 +93,7 @@ const ERR_INVALID_INT: &str = "Invalid int";
 const ERR_INT_OVERFLOW: &str = "Int overflow";
 const ERR_BLOB_END: &str = "Found unexpected blob end instruction";
 const ERR_UNDERFLOW: &str = "Stack underflow";
+const ERR_USE_AFTER_MOVE: &str = "Use after move";
 
 impl Vm {
     pub fn load(code: Vec<Op>) -> Self {
@@ -121,6 +124,7 @@ impl Vm {
 
     fn borrow(&self, src: usize, dst: usize) -> Result<Op, &'static str> {
         Ok(match self.op(src)? {
+            Moved | Take { .. } => return Err(ERR_USE_AFTER_MOVE),
             v @ (Int(_) | Var { .. }) => v,
             Ref { offset } if offset > src => return Err(ERR_INVALID_REF),
             Ref { offset } => Ref { offset: dst - (src - offset) },
@@ -141,6 +145,7 @@ impl Vm {
 
     fn resolve_slot(&self, sp: usize) -> Result<usize, &'static str> {
         match self.op(sp)? {
+            Moved => return Err(ERR_USE_AFTER_MOVE),
             Ref { offset } => sp.checked_sub(offset).ok_or(ERR_INVALID_REF),
             _ => Ok(sp),
         }
@@ -261,8 +266,29 @@ impl Vm {
 
     fn eval_once(&mut self, comptime: bool) -> Result<(), &'static str> {
         match self.stack.get(self.ip).copied().ok_or(ERR_NO_OP)?.op {
+            Moved => return Err(ERR_USE_AFTER_MOVE),
             Int(i) => {
                 self.push(Int(i));
+                self.ip += 1;
+            }
+            Take { elem } => {
+                let sp_var = self.resolve_var(elem)?;
+                match self.op(sp_var)? {
+                    Moved => return Err(ERR_USE_AFTER_MOVE),
+                    Var { elem } | Take { elem } => self.push(Take { elem }),
+                    v @ (Int(_) | Sized(List { elems: 0 }, 0)) => {
+                        self.push(v);
+                        self.stack[sp_var].op = Moved;
+                    }
+                    _ => {
+                        self.push(self.borrow(sp_var, self.stack.len())?);
+                        self.stack[sp_var].op = Moved;
+                    }
+                }
+                self.ip += 1;
+            }
+            Var { elem } => {
+                self.push(self.borrow(self.resolve_var(elem)?, self.stack.len())?);
                 self.ip += 1;
             }
             Ref { offset } => {
@@ -270,10 +296,6 @@ impl Vm {
                     return Err(ERR_INVALID_REF);
                 }
                 self.push(self.borrow(self.ip - offset, self.stack.len())?);
-                self.ip += 1;
-            }
-            Var { elem } => {
-                self.push(self.borrow(self.resolve_var(elem)?, self.stack.len())?);
                 self.ip += 1;
             }
             Sized(FnStart, slots)
@@ -308,7 +330,7 @@ impl Vm {
                 let sp = self.sp();
                 let threatened = sp - floor;
                 match self.op(sp)? {
-                    v @ (Int(_) | Var { .. }) => {
+                    v @ (Int(_) | Var { .. } | Take { .. }) => {
                         self.stack.truncate(floor);
                         self.push(v);
                     }
