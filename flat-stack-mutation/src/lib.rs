@@ -125,7 +125,7 @@ impl Vm {
     fn borrow(&self, src: usize, dst: usize) -> Result<Op, &'static str> {
         Ok(match self.op(src)? {
             Moved | Take { .. } => return Err(ERR_USE_AFTER_MOVE),
-            v @ (Int(_) | Var { .. }) => v,
+            v @ (Int(_) | Var { .. } | Sized(List { elems: 0 }, 0)) => v,
             Ref { offset } if offset > src => return Err(ERR_INVALID_REF),
             Ref { offset } => Ref { offset: dst - (src - offset) },
             Sized(_, _) => Ref { offset: dst - src },
@@ -387,6 +387,7 @@ impl Vm {
                         });
                     }
                     Sized(List { elems }, _) if elems > 0 => {
+                        // closure = [FnEnd, <arg0>, <arg1>, ...]
                         let sp_code = self.resolve_slot(sp_f - elems)?;
                         match self.op(sp_code)? {
                             Sized(FnEnd { args: a }, _) if elems - 1 + args != a => {
@@ -462,8 +463,11 @@ impl Vm {
                 let base = if sp_list == sp_op { sp_list - slots_old } else { sp_op };
                 self.push_borrows(sp_rest_last, elems - n)?;
                 self.push(Sized(List { elems: elems - n }, elems - n));
+                if elems > n {
+                    self.push(Ref { offset: 1 });
+                }
                 self.push_borrows(sp_list - 1, n)?;
-                self.push(Sized(List { elems: n + 1 }, self.stack.len() - 1 - base));
+                self.push(Sized(List { elems: n + 1 }, self.stack.len() - base));
                 self.ip += 1;
             }
             Sized(op @ Set, _) if comptime && self.defer(op, 3)? => {}
