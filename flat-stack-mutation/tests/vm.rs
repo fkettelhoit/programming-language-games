@@ -705,6 +705,350 @@ fn staged_countdown_reloads_and_runs_deep() {
     assert_eq!(reload_and_call(stage1, &[10_000]).last(), Some(&Int(5)));
 }
 
+// --- set and in-place mutation ---------------------------------------------------
+// Set's operand order is [list, elem, index]. Take is two-phase: the take
+// RESERVES (pushes a token, the binding stays readable), and the consuming op
+// ACTIVATES (tombstones the binding, token becomes a borrow) — so reads of l
+// emitted after `take l` but before the Set are legal, and read-modify-write
+// needs no operand reordering.
+
+#[test]
+fn set_in_place_on_physical_list() {
+    // set(9, 0, [1, 2, 3]) — the list is physical at the top, unobserved by
+    // construction: the element slot is overwritten in place and the closing
+    // compaction collects the spent operands below the extent.
+    assert_eq!(
+        run(
+            vec![
+                Int(1),
+                Int(2),
+                Int(3),
+                Sized(List { elems: 3 }, 0),
+                Int(9),
+                Int(0),
+                Sized(Set, 0),
+            ],
+            false
+        ),
+        [Int(9), Int(2), Int(3), Sized(List { elems: 3 }, 3)]
+    );
+}
+
+#[test]
+fn set_through_taken_arg_mutates() {
+    // f(l) = get(set(9, 0, take l), 0) == 9 — the via-ref path: the take
+    // removes the arg-slot observer, the scan between the list and the
+    // operand finds nothing, and the element is written in place.
+    let tape = run(
+        vec![
+            Sized(FnStart, 6),                           // 0  f
+            Take { elem: 0 },                            // 1  list, reserved
+            Int(9),                                      // 2  elem
+            Int(0),                                      // 3  index
+            Sized(Set, 0),                               // 4  activates the take
+            Int(0),                                      // 5
+            Sized(Get, 0),                               // 6
+            Sized(FnEnd { args: 1 }, 6),                 // 7
+            Ref { offset: 1 },                           // 8  -> f
+            Int(1),                                      // 9
+            Int(2),                                      // 10
+            Sized(List { elems: 2 }, 0),                 // 11
+            Sized(Call { args: 1, comptime: false }, 0), // 12
+        ],
+        false,
+    );
+    assert_eq!(tape.last(), Some(&Int(9)));
+}
+
+#[test]
+fn set_with_live_observer_copies() {
+    // f(l) = [set(9, 0, l), get(l, 0)] — no take, so the arg slot is a live
+    // header observer: the set must copy, and the original must still read 1
+    // afterwards. Copy-on-write is the semantics; in-place must be invisible.
+    let tape = run(
+        vec![
+            Sized(FnStart, 8),                           // 0  f
+            Var { elem: 0 },                             // 1  list, still observed
+            Int(9),                                      // 2
+            Int(0),                                      // 3
+            Sized(Set, 0),                               // 4
+            Var { elem: 0 },                             // 5
+            Int(0),                                      // 6
+            Sized(Get, 0),                               // 7
+            Sized(List { elems: 2 }, 0),                 // 8
+            Sized(FnEnd { args: 1 }, 8),                 // 9
+            Ref { offset: 1 },                           // 10 -> f
+            Int(1),                                      // 11
+            Int(2),                                      // 12
+            Sized(List { elems: 2 }, 0),                 // 13
+            Sized(Call { args: 1, comptime: false }, 0), // 14
+            Int(1),                                      // 15
+            Sized(Get, 0),                               // 16
+        ],
+        false,
+    );
+    assert_eq!(tape.last(), Some(&Int(1)));
+}
+
+#[test]
+fn set_of_elem_from_younger_list_copies() {
+    // Regression for the forward-ref case that self-derived elems can't
+    // produce: f(l, m) = set(take l, get(m, 0), 0) where m was built AFTER l,
+    // so the elem is a ref pointing ABOVE l's element slot. Writing it in
+    // place would create a forward ref; the guard must reject it and the copy
+    // path must still wire the element correctly:
+    // get(get(result, 0), 1) == 8. (The elem is computed after the take —
+    // legal under two-phase reservation.)
+    let tape = run(
+        vec![
+            Sized(FnStart, 10),                          // 0  f = fn(l, m)
+            Take { elem: 0 },                            // 1  list = take l (reserved)
+            Var { elem: 1 },                             // 2  get(m, 0)
+            Int(0),                                      // 3
+            Sized(Get, 0),                               // 4  -> ref into m, above l
+            Int(0),                                      // 5  index
+            Sized(Set, 0),                               // 6  forward ref -> copy path
+            Int(0),                                      // 7
+            Sized(Get, 0),                               // 8  -> the [7, 8] element
+            Int(1),                                      // 9
+            Sized(Get, 0),                               // 10 -> 8
+            Sized(FnEnd { args: 2 }, 10),                // 11
+            Ref { offset: 1 },                           // 12 -> f
+            Int(1),                                      // 13 l = [1, 2], built first
+            Int(2),                                      // 14
+            Sized(List { elems: 2 }, 0),                 // 15
+            Int(7),                                      // 16 m = [[7, 8]], built above
+            Int(8),                                      // 17
+            Sized(List { elems: 2 }, 0),                 // 18
+            Sized(List { elems: 1 }, 0),                 // 19
+            Sized(Call { args: 2, comptime: false }, 0), // 20
+        ],
+        false,
+    );
+    assert_eq!(tape.last(), Some(&Int(8)));
+}
+
+#[test]
+fn set_out_of_bounds_errors() {
+    let err = run_err(
+        vec![Int(1), Sized(List { elems: 1 }, 0), Int(9), Int(5), Sized(Set, 0)],
+        false,
+    );
+    assert_eq!(err, "List index is out of bounds");
+}
+
+#[test]
+fn set_on_non_list_errors() {
+    assert_eq!(
+        run_err(vec![Int(7), Int(9), Int(0), Sized(Set, 0)], false),
+        "Invalid list"
+    );
+}
+
+#[test]
+fn deferred_set_round_trips() {
+    // f(x) = set([9], x, 0) — defers on the unresolved elem, keeps the list
+    // inside the residual span, f(7) == [7].
+    let mut prog = g();
+    prog.extend([
+        Sized(FnStart, 7),                          // 3  f
+        Ref { offset: 2 },                          // 4  -> g
+        Sized(Call { args: 0, comptime: true }, 0), // 5
+        Int(9),                                     // 6  list = [9]
+        Sized(List { elems: 1 }, 0),                // 7
+        Var { elem: 0 },                            // 8  elem (unresolved)
+        Int(0),                                     // 9  index
+        Sized(Set, 0),                              // 10
+        Sized(FnEnd { args: 1 }, 7),                // 11
+    ]);
+    let stage1 = run(prog, true);
+    let tape = reload_and_call(stage1, &[7]);
+    let [.., a, Sized(List { elems: 1 }, _)] = tape[..] else {
+        panic!("expected a 1-element list, got {:?}", &tape[tape.len() - 2..]);
+    };
+    assert_eq!(a, Int(7));
+}
+
+/// increment-map as a self-capturing closure over `l`, then `tail`:
+/// map(self, l, i) = if len(l) == i { l }
+///                   else { map(self, set(take l, i, get(l, i) + 1), i + 1) }
+/// The take RESERVES l, the get still reads it, and the Set activates the
+/// move — read-modify-write in one frame under the original operand order,
+/// which is what two-phase Take exists for. `pad` prepends an inert blob so
+/// the watermark test's peak sits clear of Vec's capacity-doubling
+/// boundaries.
+fn increment_map(pad: usize, l: &[i64], tail: &[Op]) -> Vec<Op> {
+    let mut prog = vec![];
+    if pad > 0 {
+        prog.push(Sized(BlobStart, pad));
+        prog.extend(std::iter::repeat(Int(0)).take(pad));
+        prog.push(Sized(BlobEnd, pad));
+    }
+    prog.extend([
+        Sized(FnStart, 25),                          // +0  fn(self, l, i)
+        Sized(FnStart, 1),                           // +1  then: l
+        Var { elem: 1 },                             // +2
+        Sized(FnEnd { args: 0 }, 1),                 // +3
+        Sized(FnStart, 15),                          // +4  else
+        Var { elem: 0 },                             // +5  callee [self, self]
+        Var { elem: 0 },                             // +6
+        Sized(List { elems: 2 }, 0),                 // +7
+        Take { elem: 1 },                            // +8  list = take l (reserved)
+        Var { elem: 1 },                             // +9  elem = get(l, i) + 1
+        Var { elem: 2 },                             // +10
+        Sized(Get, 0),                               // +11
+        Int(1),                                      // +12
+        Sized(Bin(BinOp::Add), 0),                   // +13
+        Var { elem: 2 },                             // +14 index = i
+        Sized(Set, 0),                               // +15 activates the take
+        Var { elem: 2 },                             // +16 i + 1
+        Int(1),                                      // +17
+        Sized(Bin(BinOp::Add), 0),                   // +18
+        Sized(Call { args: 2, comptime: false }, 0), // +19
+        Sized(FnEnd { args: 0 }, 15),                // +20
+        Var { elem: 1 },                             // +21 cond: len(l) == i
+        Sized(Len, 0),                               // +22
+        Var { elem: 2 },                             // +23
+        Sized(Bin(BinOp::Eq), 0),                    // +24
+        Sized(If, 0),                                // +25
+        Sized(FnEnd { args: 3 }, 25),                // +26
+        Ref { offset: 1 },                           // +27
+        Ref { offset: 2 },                           // +28
+        Sized(List { elems: 2 }, 0),                 // +29
+    ]);
+    for &x in l {
+        prog.push(Int(x));
+    }
+    prog.push(Sized(List { elems: l.len() }, 0));
+    prog.push(Int(0));
+    prog.push(Sized(Call { args: 2, comptime: false }, 0));
+    prog.extend_from_slice(tail);
+    prog
+}
+
+#[test]
+fn map_increments_every_element() {
+    // Small lists fail the walk's distance gate (frame junk > elems), so this
+    // exercises the copy path end to end through the same program the
+    // watermark test runs in place.
+    let tape = run(increment_map(0, &[10, 20, 30], &[Int(2), Sized(Get, 0)]), false);
+    assert_eq!(tape.last(), Some(&Int(31)));
+    let tape = run(increment_map(0, &[10, 20, 30], &[Int(0), Sized(Get, 0)]), false);
+    assert_eq!(tape.last(), Some(&Int(11)));
+}
+
+#[test]
+fn map_over_taken_list_runs_in_place() {
+    // The stage-4 milestone: in-place atomic map. The list lives below the
+    // loop's floor and is mutated where it sits, so the value-region peak is
+    // one list plus a bounded frame — with the blob pad, capacity stays at
+    // one doubling (~6100). The copy path retains the original below the
+    // floor for the whole loop and holds two copies per iteration, pushing
+    // the peak past the next doubling (~12200).
+    let n = 2000;
+    let l: Vec<i64> = vec![0; n];
+    let mut vm = Vm::load(increment_map(1000, &l, &[Int(1500), Sized(Get, 0)]));
+    vm.run(false).expect("map(2000)");
+    assert_eq!(vm.stack.last().map(|slot| slot.op), Some(Int(1)));
+    assert!(vm.stack.capacity() < 8000, "stack peaked at {}", vm.stack.capacity());
+}
+
+#[test]
+fn push_with_live_observer_preserves_the_original() {
+    // f(l) = [push(l, 9), get(get(l, 0), 0)] with l = [[7, 8]] — the push
+    // goes copy-on-write (the arg slot observes l), and the SHARED original
+    // must stay fully intact: its ref-valued element slots are live storage
+    // for every other observer, not spent handles. Consume-mode borrowing of
+    // the old elements is only sound when the original is physical (provably
+    // unobserved); via-ref it corrupts the original.
+    let tape = run(
+        vec![
+            Sized(FnStart, 9),                           // 0  f
+            Var { elem: 0 },                             // 1  push(l, 9)
+            Int(9),                                      // 2
+            Sized(Push { elems: 1 }, 0),                 // 3
+            Var { elem: 0 },                             // 4  get(get(l, 0), 0)
+            Int(0),                                      // 5
+            Sized(Get, 0),                               // 6
+            Int(0),                                      // 7
+            Sized(Get, 0),                               // 8
+            Sized(List { elems: 2 }, 0),                 // 9
+            Sized(FnEnd { args: 1 }, 9),                 // 10
+            Ref { offset: 1 },                           // 11 -> f
+            Int(7),                                      // 12
+            Int(8),                                      // 13
+            Sized(List { elems: 2 }, 0),                 // 14 inner [7, 8]
+            Sized(List { elems: 1 }, 0),                 // 15 l = [[7, 8]]
+            Sized(Call { args: 1, comptime: false }, 0), // 16
+            Int(1),                                      // 17
+            Sized(Get, 0),                               // 18
+        ],
+        false,
+    );
+    assert_eq!(tape.last(), Some(&Int(7)));
+}
+
+#[test]
+fn pop_with_live_observer_preserves_the_original() {
+    // Same contract for Pop: f(l) = [pop1(l), get(get(l, 0), 1)] with
+    // l = [[7, 8]] — the copy-path pop borrows the original's elements but
+    // must not consume them while the original is observed.
+    let tape = run(
+        vec![
+            Sized(FnStart, 8),                           // 0  f
+            Var { elem: 0 },                             // 1  pop1(l)
+            Sized(Pop { elems: 1 }, 0),                  // 2
+            Var { elem: 0 },                             // 3  get(get(l, 0), 1)
+            Int(0),                                      // 4
+            Sized(Get, 0),                               // 5
+            Int(1),                                      // 6
+            Sized(Get, 0),                               // 7
+            Sized(List { elems: 2 }, 0),                 // 8
+            Sized(FnEnd { args: 1 }, 8),                 // 9
+            Ref { offset: 1 },                           // 10 -> f
+            Int(7),                                      // 11
+            Int(8),                                      // 12
+            Sized(List { elems: 2 }, 0),                 // 13 inner [7, 8]
+            Sized(List { elems: 1 }, 0),                 // 14 l = [[7, 8]]
+            Sized(Call { args: 1, comptime: false }, 0), // 15
+            Int(1),                                      // 16
+            Sized(Get, 0),                               // 17
+        ],
+        false,
+    );
+    assert_eq!(tape.last(), Some(&Int(8)));
+}
+
+#[test]
+fn closure_call_with_multi_slot_arg_keeps_its_interior() {
+    // The closure-arm gate for consume-mode arg normalization: a physical
+    // multi-slot arg with ref-valued element slots. Only the operand's TOP
+    // slot is a spent handle; borrowing must walk by value and never tombstone
+    // interior slots. c = [code, code]; body(self, l) = get(get(l, 0), 1),
+    // called with [[7, 8]] == 8.
+    let tape = run(
+        vec![
+            Sized(FnStart, 5),                           // 0  fn(self, l)
+            Var { elem: 1 },                             // 1
+            Int(0),                                      // 2
+            Sized(Get, 0),                               // 3
+            Int(1),                                      // 4
+            Sized(Get, 0),                               // 5
+            Sized(FnEnd { args: 2 }, 5),                 // 6
+            Ref { offset: 1 },                           // 7
+            Ref { offset: 2 },                           // 8
+            Sized(List { elems: 2 }, 0),                 // 9  c = [code, code]
+            Int(7),                                      // 10
+            Int(8),                                      // 11
+            Sized(List { elems: 2 }, 0),                 // 12 inner [7, 8]
+            Sized(List { elems: 1 }, 0),                 // 13 arg = [[7, 8]]
+            Sized(Call { args: 1, comptime: false }, 0), // 14
+        ],
+        false,
+    );
+    assert_eq!(tape.last(), Some(&Int(8)));
+}
+
 // --- take and moved ------------------------------------------------------------
 
 #[test]
@@ -772,23 +1116,106 @@ fn take_of_an_empty_list_arg() {
 
 #[test]
 fn use_after_take_errors() {
-    // f(x) = [take x, x] — reading a binding after moving out of it is the
-    // one thing Moved exists to catch: without the tombstone, the second use
-    // would silently observe whatever the first use's consumer did.
+    // f(x) = [set(take x, 0, 9), x] — under two-phase take, use-after-move
+    // means reading the binding after a consumer ACTIVATED the move: the Set
+    // tombstones the slot, so the Var afterwards is the error Moved exists to
+    // catch (without it, the read would silently observe the mutation).
     let err = run_err(
         vec![
-            Sized(FnStart, 3),                           // 0  f
-            Take { elem: 0 },                            // 1
-            Var { elem: 0 },                             // 2
-            Sized(List { elems: 2 }, 0),                 // 3
-            Sized(FnEnd { args: 1 }, 3),                 // 4
-            Ref { offset: 1 },                           // 5  -> f
-            Int(5),                                      // 6
-            Sized(Call { args: 1, comptime: false }, 0), // 7
+            Sized(FnStart, 6),                           // 0  f
+            Take { elem: 0 },                            // 1  reserved
+            Int(9),                                      // 2
+            Int(0),                                      // 3
+            Sized(Set, 0),                               // 4  activated here
+            Var { elem: 0 },                             // 5  read after the move
+            Sized(List { elems: 2 }, 0),                 // 6
+            Sized(FnEnd { args: 1 }, 6),                 // 7
+            Ref { offset: 1 },                           // 8  -> f
+            Int(1),                                      // 9
+            Sized(List { elems: 1 }, 0),                 // 10
+            Sized(Call { args: 1, comptime: false }, 0), // 11
         ],
         false,
     );
     assert_eq!(err, "Use after move");
+}
+
+#[test]
+fn take_reserves_without_excluding_reads() {
+    // f(x) = [take x, x] — the OLD use-after-move shape, now legal by design:
+    // a reservation permits reads until a consumer activates it. Here the
+    // List is the consumer, so both elements see x. get(f(5), 0) == 5.
+    let tape = run(
+        vec![
+            Sized(FnStart, 3),                           // 0  f
+            Take { elem: 0 },                            // 1  reserved
+            Var { elem: 0 },                             // 2  still readable
+            Sized(List { elems: 2 }, 0),                 // 3  activates the take
+            Sized(FnEnd { args: 1 }, 3),                 // 4
+            Ref { offset: 1 },                           // 5  -> f
+            Int(5),                                      // 6
+            Sized(Call { args: 1, comptime: false }, 0), // 7
+            Int(0),                                      // 8
+            Sized(Get, 0),                               // 9
+        ],
+        false,
+    );
+    assert_eq!(tape.last(), Some(&Int(5)));
+}
+
+#[test]
+fn returning_a_taken_list_moves_it_out() {
+    // f(l) = take l — a token as the return value: FnEnd is the consumer and
+    // activates the move while the frame is still alive.
+    let tape = run(
+        vec![
+            Sized(FnStart, 1),                           // 0  f
+            Take { elem: 0 },                            // 1
+            Sized(FnEnd { args: 1 }, 1),                 // 2
+            Ref { offset: 1 },                           // 3  -> f
+            Int(1),                                      // 4
+            Int(2),                                      // 5
+            Sized(List { elems: 2 }, 0),                 // 6
+            Sized(Call { args: 1, comptime: false }, 0), // 7
+            Int(1),                                      // 8
+            Sized(Get, 0),                               // 9
+        ],
+        false,
+    );
+    assert_eq!(tape.last(), Some(&Int(2)));
+}
+
+#[test]
+fn push_of_element_derived_from_taken_list() {
+    // f(l) = push(take l, get(l, 0) + get(l, 1)) — the fib/prefix-sum shape:
+    // the pushed element derives from the very list being moved. Two-phase
+    // reservation makes this expressible with Push's unchanged list-first
+    // operand order — the other front of the operand-order debate, settled by
+    // test. get(f([1, 2]), 2) == 3.
+    let tape = run(
+        vec![
+            Sized(FnStart, 9),                           // 0  f
+            Take { elem: 0 },                            // 1  list (reserved)
+            Var { elem: 0 },                             // 2  get(l, 0)
+            Int(0),                                      // 3
+            Sized(Get, 0),                               // 4
+            Var { elem: 0 },                             // 5  get(l, 1)
+            Int(1),                                      // 6
+            Sized(Get, 0),                               // 7
+            Sized(Bin(BinOp::Add), 0),                   // 8
+            Sized(Push { elems: 1 }, 0),                 // 9  activates the take
+            Sized(FnEnd { args: 1 }, 9),                 // 10
+            Ref { offset: 1 },                           // 11 -> f
+            Int(1),                                      // 12
+            Int(2),                                      // 13
+            Sized(List { elems: 2 }, 0),                 // 14
+            Sized(Call { args: 1, comptime: false }, 0), // 15
+            Int(2),                                      // 16
+            Sized(Get, 0),                               // 17
+        ],
+        false,
+    );
+    assert_eq!(tape.last(), Some(&Int(3)));
 }
 
 #[test]
