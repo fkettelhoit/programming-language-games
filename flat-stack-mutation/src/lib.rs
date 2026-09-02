@@ -354,9 +354,8 @@ impl Vm {
 
     fn eval_once(&mut self, comptime: bool) -> Result<(), &'static str> {
         match self.stack.get(self.ip).copied().ok_or(ERR_NO_OP)?.op {
-            Moved => return Err(ERR_USE_AFTER_MOVE),
-            Int(i) => {
-                self.push(Int(i));
+            v @ (Moved | Int(_)) => {
+                self.push(v);
                 self.ip += 1;
             }
             Take { elem } => {
@@ -416,7 +415,7 @@ impl Vm {
                         self.stack.truncate(floor);
                         self.push(Ref { offset: offset - threatened });
                     }
-                    Sized(List { elems }, slots) if !comptime && threatened - slots <= slots => {
+                    Sized(List { elems }, slots) if threatened - slots <= slots => {
                         self.stack[sp].op = Sized(List { elems }, sp - floor);
                     }
                     _ => self.gc_until(floor)?,
@@ -456,9 +455,7 @@ impl Vm {
                             self.push_borrows(sp_args, args, true)?;
                         }
                         let (sp_f, frame) = match (self.op(self.ip + 1)?, self.frames.last()) {
-                            (Sized(FnEnd { .. }, _), Some(frame))
-                                if !comptime && !frame.is_deferred =>
-                            {
+                            (Sized(FnEnd { .. }, _), Some(frame)) if !frame.is_deferred => {
                                 let frame = self.pop_tail_frames()?;
                                 let sp_f =
                                     self.gc_block(frame.floor..sp_op - slots_op + 1, sp_f)?;
@@ -488,7 +485,7 @@ impl Vm {
                                 let (sp_code, frame) =
                                     match (self.op(self.ip + 1)?, self.frames.last()) {
                                         (Sized(FnEnd { .. }, _), Some(frame))
-                                            if !comptime && !frame.is_deferred =>
+                                            if !frame.is_deferred =>
                                         {
                                             let frame = self.pop_tail_frames()?;
                                             let sp_code = self.gc_block(
