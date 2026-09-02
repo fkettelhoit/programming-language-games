@@ -53,9 +53,12 @@ impl SizedOp {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum BinOp {
     Eq,
+    Lt,
     Add,
     Sub,
     Mul,
+    Div,
+    Rem,
 }
 
 use std::ops::Range;
@@ -719,11 +722,13 @@ impl Vm {
                     return Err(ERR_INVALID_INT);
                 };
                 let slot = match bin_op {
-                    BinOp::Eq if a == b => Int(1),
-                    BinOp::Eq => Int(0),
+                    BinOp::Eq => Int(if a == b { 1 } else { 0 }),
+                    BinOp::Lt => Int(if a < b { 1 } else { 0 }),
                     BinOp::Add => Int(a.checked_add(b).ok_or(ERR_INT_OVERFLOW)?),
                     BinOp::Sub => Int(a.checked_sub(b).ok_or(ERR_INT_OVERFLOW)?),
                     BinOp::Mul => Int(a.checked_mul(b).ok_or(ERR_INT_OVERFLOW)?),
+                    BinOp::Div => Int(a.checked_div(b).ok_or(ERR_INT_OVERFLOW)?),
+                    BinOp::Rem => Int(a.checked_rem(b).ok_or(ERR_INT_OVERFLOW)?),
                 };
                 self.stack.truncate(self.stack.len() - 2);
                 self.push(slot);
