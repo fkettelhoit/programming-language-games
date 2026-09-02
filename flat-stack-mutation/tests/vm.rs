@@ -190,12 +190,7 @@ fn borrowed_empty_list_is_copied_not_referenced() {
             ],
             false
         ),
-        [
-            Sized(List { elems: 0 }, 0),
-            Int(1),
-            Int(2),
-            Sized(List { elems: 3 }, 3),
-        ]
+        [Sized(List { elems: 0 }, 0), Int(1), Int(2), Sized(List { elems: 3 }, 3),]
     );
 }
 
@@ -220,10 +215,7 @@ fn pop_of_zero_elements_wraps_the_whole_list() {
 
 #[test]
 fn pop_of_more_than_len_errors() {
-    let err = run_err(
-        vec![Int(1), Sized(List { elems: 1 }, 0), Sized(Pop { elems: 2 }, 0)],
-        false,
-    );
+    let err = run_err(vec![Int(1), Sized(List { elems: 1 }, 0), Sized(Pop { elems: 2 }, 0)], false);
     assert_eq!(err, "List index is out of bounds");
 }
 
@@ -830,19 +822,14 @@ fn set_of_elem_from_younger_list_copies() {
 
 #[test]
 fn set_out_of_bounds_errors() {
-    let err = run_err(
-        vec![Int(1), Sized(List { elems: 1 }, 0), Int(9), Int(5), Sized(Set, 0)],
-        false,
-    );
+    let err =
+        run_err(vec![Int(1), Sized(List { elems: 1 }, 0), Int(9), Int(5), Sized(Set, 0)], false);
     assert_eq!(err, "List index is out of bounds");
 }
 
 #[test]
 fn set_on_non_list_errors() {
-    assert_eq!(
-        run_err(vec![Int(7), Int(9), Int(0), Sized(Set, 0)], false),
-        "Invalid list"
-    );
+    assert_eq!(run_err(vec![Int(7), Int(9), Int(0), Sized(Set, 0)], false), "Invalid list");
 }
 
 #[test]
@@ -1302,13 +1289,7 @@ fn symbolic_take_re_emits_itself() {
     let stage1 = run(prog, true);
     assert_eq!(
         stage1,
-        [
-            Sized(FnStart, 3),
-            Take { elem: 0 },
-            Int(0),
-            Sized(Get, 2),
-            Sized(FnEnd { args: 1 }, 3),
-        ]
+        [Sized(FnStart, 3), Take { elem: 0 }, Int(0), Sized(Get, 2), Sized(FnEnd { args: 1 }, 3),]
     );
     let tape = reload_and_call_with(stage1, &[vec![Int(8), Sized(List { elems: 1 }, 0)]]);
     assert_eq!(tape.last(), Some(&Int(8)));
