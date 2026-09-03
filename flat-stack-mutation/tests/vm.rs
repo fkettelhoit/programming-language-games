@@ -45,58 +45,29 @@ fn g() -> Vec<Op> {
     vec![Sized(FnStart, 1), Int(5), Sized(FnEnd { args: 0 }, 1)]
 }
 
-// --- pop: copy path ------------------------------------------------------------
+// --- pop (truncate) ------------------------------------------------------------
+// Pop{k} drops the last k elements and yields the shortened list as its one value.
+// The dropped elements are read beforehand with Len/Sub/Get, so `[init, last]`
+// costs two ops and no wrapper. A physical list at the top, or a taken buried
+// list with no observer between it and the operand, shrinks in place; anything
+// observed copies the kept elements.
 
 #[test]
-fn pop_of_physical_list_yields_canonical_pair() {
-    // pop{1} on [1, 2, 3] leaves a single value: the pair [rest, elem]. The
-    // pair follows the same normalization convention as every other
-    // list-producing op — its element region is packed, one slot per element,
-    // so element 0 is a handle to rest, not the rest header itself. That is
-    // what makes the pair a value at comptime (is_value's packed check), lets
-    // Get's physical path address elements by slot, and lets compaction mark
-    // the elements precisely: the consumed original [1, 2, 3] is collected
-    // here because its atoms were copied out and nothing references it.
+fn pop_of_physical_list_drops_the_last() {
+    // pop1([1, 2, 3]): the list is physical and unobserved, so it shrinks where
+    // it sits. The header moves down by one and the kept elements stay put.
     assert_eq!(
         run(
             vec![Int(1), Int(2), Int(3), Sized(List { elems: 3 }, 0), Sized(Pop { elems: 1 }, 0)],
             false
         ),
-        [
-            Int(1),
-            Int(2),
-            Sized(List { elems: 2 }, 2), // rest = [1, 2]
-            Ref { offset: 1 },           // pair element 0 -> rest
-            Int(3),                      // pair element 1 = the popped atom
-            Sized(List { elems: 2 }, 5), // the pair, extending to its base
-        ]
+        [Int(1), Int(2), Sized(List { elems: 2 }, 2)]
     );
-}
-
-#[test]
-fn popped_element_is_the_last() {
-    // get(pop1([1, 2, 3]), 1) == 3 — in the flat layout the cheap end is the
-    // back, so pop takes the topmost element.
-    let tape = run(
-        vec![
-            Int(1),
-            Int(2),
-            Int(3),
-            Sized(List { elems: 3 }, 0),
-            Sized(Pop { elems: 1 }, 0),
-            Int(1),
-            Sized(Get, 0),
-        ],
-        false,
-    );
-    assert_eq!(tape.last(), Some(&Int(3)));
 }
 
 #[test]
 fn popped_rest_keeps_its_elements() {
-    // get(get(pop1([1, 2, 3]), 0), 1) == 2 — extracting rest goes through the
-    // pair's element-0 handle (an internal ref, resolved by Get's compacting
-    // arm), and the shortened list still indexes correctly.
+    // get(pop1([1, 2, 3]), 1) == 2.
     let tape = run(
         vec![
             Int(1),
@@ -104,8 +75,6 @@ fn popped_rest_keeps_its_elements() {
             Int(3),
             Sized(List { elems: 3 }, 0),
             Sized(Pop { elems: 1 }, 0),
-            Int(0),
-            Sized(Get, 0),
             Int(1),
             Sized(Get, 0),
         ],
@@ -115,9 +84,8 @@ fn popped_rest_keeps_its_elements() {
 }
 
 #[test]
-fn pop_of_several_elements_keeps_their_order() {
-    // pop{2} on [1, 2, 3] yields [rest, 2, 3]: popped elements appear in
-    // original order, so Pop{k} is the exact inverse of Push{k}.
+fn pop_of_several_elements_keeps_the_prefix() {
+    // pop2([1, 2, 3]) == [1]: len is 1 and element 0 is untouched.
     let tape = run(
         vec![
             Int(1),
@@ -125,92 +93,33 @@ fn pop_of_several_elements_keeps_their_order() {
             Int(3),
             Sized(List { elems: 3 }, 0),
             Sized(Pop { elems: 2 }, 0),
-            Int(1),
+            Int(0),
             Sized(Get, 0),
         ],
         false,
     );
-    assert_eq!(tape.last(), Some(&Int(2)));
+    assert_eq!(tape.last(), Some(&Int(1)));
 }
 
 #[test]
-fn pop_of_all_elements_leaves_empty_rest() {
-    // pop{3} on [1, 2, 3] yields [[], 1, 2, 3]; extracting rest gives the
-    // empty list, and the closing compaction collects everything else.
+fn pop_of_all_elements_leaves_the_empty_list() {
+    // pop3([1, 2, 3]) == []: the extent shrinks to zero, which is the canonical
+    // empty list, and the closing compaction drops everything else.
     assert_eq!(
         run(
-            vec![
-                Int(1),
-                Int(2),
-                Int(3),
-                Sized(List { elems: 3 }, 0),
-                Sized(Pop { elems: 3 }, 0),
-                Int(0),
-                Sized(Get, 0),
-            ],
-            false,
+            vec![Int(1), Int(2), Int(3), Sized(List { elems: 3 }, 0), Sized(Pop { elems: 3 }, 0)],
+            false
         ),
         [Sized(List { elems: 0 }, 0)]
     );
 }
 
 #[test]
-fn fully_drained_pop_stores_empty_rest_in_place() {
-    // The empty list is the one Sized value that is atom-like: one slot,
-    // self-contained. A fully drained pop therefore stores the empty rest
-    // header DIRECTLY in the pair's element-0 slot — no handle — exactly as
-    // List construction leaves any 1-slot element in place. This pins the
-    // layout itself (the ref version would leave a 4-slot tape); the in-place
-    // pop of stage 5 must reproduce this same shape.
+fn pop_of_zero_elements_is_the_identity() {
     assert_eq!(
-        run(vec![Int(1), Sized(List { elems: 1 }, 0), Sized(Pop { elems: 1 }, 0)], false),
-        [
-            Sized(List { elems: 0 }, 0), // pair element 0: empty rest, in place
-            Int(1),                      // pair element 1: the popped atom
-            Sized(List { elems: 2 }, 2),
-        ]
+        run(vec![Int(1), Int(2), Sized(List { elems: 2 }, 0), Sized(Pop { elems: 0 }, 0)], false),
+        [Int(1), Int(2), Sized(List { elems: 2 }, 2)]
     );
-}
-
-#[test]
-fn borrowed_empty_list_is_copied_not_referenced() {
-    // borrow treats the empty list as an atom too: copying a list whose
-    // element region holds a physical empty header must copy it, not ref it.
-    // push([[], 1], 2) — with a copying borrow the new list carries no refs,
-    // so the consumed original is fully collected; a ref-borrow would pin the
-    // old extent alive and the tape would retain it as garbage.
-    assert_eq!(
-        run(
-            vec![
-                Sized(List { elems: 0 }, 0), // []
-                Int(1),
-                Sized(List { elems: 2 }, 0), // l = [[], 1]
-                Int(2),
-                Sized(Push { elems: 1 }, 0), // push(l, 2)
-            ],
-            false
-        ),
-        [Sized(List { elems: 0 }, 0), Int(1), Int(2), Sized(List { elems: 3 }, 3),]
-    );
-}
-
-#[test]
-fn pop_of_zero_elements_wraps_the_whole_list() {
-    // pop{0} is degenerate but well-defined: the pair is [rest] with rest the
-    // untouched list. len(get(pop0([1, 2]), 0)) == 2.
-    let tape = run(
-        vec![
-            Int(1),
-            Int(2),
-            Sized(List { elems: 2 }, 0),
-            Sized(Pop { elems: 0 }, 0),
-            Int(0),
-            Sized(Get, 0),
-            Sized(Len, 0),
-        ],
-        false,
-    );
-    assert_eq!(tape.last(), Some(&Int(2)));
 }
 
 #[test]
@@ -225,10 +134,9 @@ fn pop_of_non_list_errors() {
 }
 
 #[test]
-fn pop_through_a_borrowed_arg() {
-    // f(x) = get(pop1(x), 1), f([1, 2, 3]) == 3 — the via-ref path: inside f
-    // the list is only reachable through the arg slot's borrow, and the pair
-    // extends over the ref operand rather than the (unowned) original.
+fn pop_through_a_borrowed_arg_copies() {
+    // f(x) = get(pop1(x), 1), f([1, 2, 3]) == 2 — the arg slot is a live
+    // observer, so the kept elements are copied above the operand.
     let tape = run(
         vec![
             Sized(FnStart, 4),                           // 0  f
@@ -246,77 +154,120 @@ fn pop_through_a_borrowed_arg() {
         ],
         false,
     );
-    assert_eq!(tape.last(), Some(&Int(3)));
-}
-
-#[test]
-fn pop_of_list_with_nested_last_element() {
-    // l = [1, [2, 3]]: the popped element is a ref into the pair's adopted
-    // extent; extracting it must keep the nested list alive through
-    // compaction. get(get(pop1(l), 1), 0) == 2.
-    let tape = run(
-        vec![
-            Int(1),
-            Int(2),
-            Int(3),
-            Sized(List { elems: 2 }, 0), // inner = [2, 3]
-            Sized(List { elems: 2 }, 0), // l = [1, inner]
-            Sized(Pop { elems: 1 }, 0),
-            Int(1),
-            Sized(Get, 0),
-            Int(0),
-            Sized(Get, 0),
-        ],
-        false,
-    );
     assert_eq!(tape.last(), Some(&Int(2)));
 }
 
 #[test]
-fn pop_destructured_through_a_call_reassembles() {
-    // f(p) = push(get(p, 0), get(p, 1)) — the "bind is a call" pattern from
-    // the design discussion: both pair halves are consumed via Var borrows,
-    // and push(rest, elem) rebuilds the original list. get(f(pop1(l)), 2) == 3.
+fn pop_keeps_a_nested_element_reachable() {
+    // l = [[2, 3], 1]: after pop1 the remaining element is a ref into the
+    // adopted extent, and compaction must keep the nested list alive.
+    // get(get(pop1(l), 0), 1) == 3.
     let tape = run(
         vec![
-            Sized(FnStart, 7),                           // 0  f
-            Var { elem: 0 },                             // 1
-            Int(0),                                      // 2
-            Sized(Get, 0),                               // 3
-            Var { elem: 0 },                             // 4
-            Int(1),                                      // 5
-            Sized(Get, 0),                               // 6
-            Sized(Push { elems: 1 }, 0),                 // 7
-            Sized(FnEnd { args: 1 }, 7),                 // 8
-            Ref { offset: 1 },                           // 9  -> f
-            Int(1),                                      // 10
-            Int(2),                                      // 11
-            Int(3),                                      // 12
-            Sized(List { elems: 3 }, 0),                 // 13
-            Sized(Pop { elems: 1 }, 0),                  // 14
-            Sized(Call { args: 1, comptime: false }, 0), // 15
-            Int(2),                                      // 16
-            Sized(Get, 0),                               // 17
+            Int(2),
+            Int(3),
+            Sized(List { elems: 2 }, 0), // inner = [2, 3]
+            Int(1),
+            Sized(List { elems: 2 }, 0), // l = [inner, 1]
+            Sized(Pop { elems: 1 }, 0),
+            Int(0),
+            Sized(Get, 0),
+            Int(1),
+            Sized(Get, 0),
         ],
         false,
     );
     assert_eq!(tape.last(), Some(&Int(3)));
+}
+
+#[test]
+fn pop_then_push_reassembles() {
+    // f(l) = push(pop1(l), get(l, 2)): Pop{k} followed by Push{k} of the
+    // dropped elements is the identity. get(f([1, 2, 3]), 2) == 3.
+    let tape = run(
+        vec![
+            Sized(FnStart, 6),                           // 0  f
+            Var { elem: 0 },                             // 1
+            Sized(Pop { elems: 1 }, 0),                  // 2
+            Var { elem: 0 },                             // 3
+            Int(2),                                      // 4
+            Sized(Get, 0),                               // 5
+            Sized(Push { elems: 1 }, 0),                 // 6
+            Sized(FnEnd { args: 1 }, 6),                 // 7
+            Ref { offset: 1 },                           // 8  -> f
+            Int(1),                                      // 9
+            Int(2),                                      // 10
+            Int(3),                                      // 11
+            Sized(List { elems: 3 }, 0),                 // 12
+            Sized(Call { args: 1, comptime: false }, 0), // 13
+            Int(2),                                      // 14
+            Sized(Get, 0),                               // 15
+        ],
+        false,
+    );
+    assert_eq!(tape.last(), Some(&Int(3)));
+}
+
+#[test]
+fn pop_in_place_under_a_live_frame_keeps_the_bindings() {
+    // f(l, m) = [pop(take l, 1), m] with a six-element l, so the distance gate
+    // passes and the buried list shrinks in place. The frame's bindings, the
+    // token and everything else above the list must survive: m is read AFTER
+    // the pop, and the shortened list must still have five elements.
+    // get(f(l, 7), 1) == 7 and len(get(f(l, 7), 0)) == 5.
+    let f = |tail: &[Op]| {
+        let mut prog = vec![
+            Sized(FnStart, 4),           // 0  f
+            Take { elem: 0 },            // 1
+            Sized(Pop { elems: 1 }, 0),  // 2  in place, buried
+            Var { elem: 1 },             // 3  m, read after the pop
+            Sized(List { elems: 2 }, 0), // 4
+            Sized(FnEnd { args: 2 }, 4), // 5
+            Ref { offset: 1 },           // 6  -> f
+        ];
+        prog.extend((1..=6).map(Int));
+        prog.extend([
+            Sized(List { elems: 6 }, 0),
+            Int(7),
+            Sized(Call { args: 2, comptime: false }, 0),
+        ]);
+        prog.extend_from_slice(tail);
+        prog
+    };
+    assert_eq!(run(f(&[Int(1), Sized(Get, 0)]), false).last(), Some(&Int(7)));
+    assert_eq!(run(f(&[Int(0), Sized(Get, 0), Sized(Len, 0)]), false).last(), Some(&Int(5)));
+}
+
+#[test]
+fn pop_in_place_through_a_taken_arg_returns_the_shrunk_list() {
+    // f(l) = pop(take l, 1) over six elements: the list shrinks where it sits
+    // and the closing compaction yields exactly the five kept elements.
+    let mut prog = vec![
+        Sized(FnStart, 2),           // 0  f
+        Take { elem: 0 },            // 1
+        Sized(Pop { elems: 1 }, 0),  // 2
+        Sized(FnEnd { args: 1 }, 2), // 3
+        Ref { offset: 1 },           // 4  -> f
+    ];
+    prog.extend((1..=6).map(Int));
+    prog.extend([Sized(List { elems: 6 }, 0), Sized(Call { args: 1, comptime: false }, 0)]);
+    assert_eq!(
+        run(prog, false),
+        [Int(1), Int(2), Int(3), Int(4), Int(5), Sized(List { elems: 5 }, 5)]
+    );
 }
 
 // --- pop: comptime -------------------------------------------------------------
 
 #[test]
 fn comptime_pop_with_resolved_list_evaluates() {
-    // f(xs) = get(pop1(xs), 1), called as f!([1, 2]) — a resolved operand
-    // means Pop and Get both evaluate at comptime, which requires the pair to
-    // count as a value (packed element region). Regression guard: an
-    // unnormalized pair fails is_value, so the Get would spuriously defer and
-    // the tape would end in a residual span instead of 2.
+    // f(xs) = get(pop1(xs), 0), called as f!([1, 2]): a resolved operand means
+    // Pop and Get both evaluate at comptime and the tape ends in 1.
     let prog = vec![
         Sized(FnStart, 4),                          // 0  f
         Var { elem: 0 },                            // 1
         Sized(Pop { elems: 1 }, 0),                 // 2
-        Int(1),                                     // 3
+        Int(0),                                     // 3
         Sized(Get, 0),                              // 4
         Sized(FnEnd { args: 1 }, 4),                // 5
         Ref { offset: 1 },                          // 6  -> f
@@ -325,15 +276,14 @@ fn comptime_pop_with_resolved_list_evaluates() {
         Sized(List { elems: 2 }, 0),                // 9
         Sized(Call { args: 1, comptime: true }, 0), // 10
     ];
-    assert_eq!(run(prog, true).last(), Some(&Int(2)));
+    assert_eq!(run(prog, true).last(), Some(&Int(1)));
 }
 
 #[test]
 fn deferred_pop_round_trips() {
-    // f(x) = get(pop1(x), 1) with x unresolved: Pop defers on the var, Get
-    // defers on the Pop span (computations are contagious), and the residual
-    // program computes the same result as direct evaluation — the
-    // stage-uniformity property that made single-valued Pop the design choice.
+    // f(x) = get(pop1(x), 0) with x unresolved: Pop defers on the var, Get
+    // defers on the Pop span, and the residual computes the same result as
+    // direct evaluation.
     let mut prog = g();
     prog.extend([
         Sized(FnStart, 6),                          // 3  f
@@ -341,7 +291,7 @@ fn deferred_pop_round_trips() {
         Sized(Call { args: 0, comptime: true }, 0), // 5
         Var { elem: 0 },                            // 6
         Sized(Pop { elems: 1 }, 0),                 // 7
-        Int(1),                                     // 8
+        Int(0),                                     // 8
         Sized(Get, 0),                              // 9
         Sized(FnEnd { args: 1 }, 6),                // 10
     ]);
@@ -351,7 +301,7 @@ fn deferred_pop_round_trips() {
         "expected a residual Pop span, got {stage1:?}"
     );
     let tape = reload_and_call_with(stage1, &[vec![Int(8), Int(9), Sized(List { elems: 2 }, 0)]]);
-    assert_eq!(tape.last(), Some(&Int(9)));
+    assert_eq!(tape.last(), Some(&Int(8)));
 }
 
 // --- tail calls ----------------------------------------------------------------
@@ -1004,6 +954,39 @@ fn pop_with_live_observer_preserves_the_original() {
         false,
     );
     assert_eq!(tape.last(), Some(&Int(8)));
+}
+
+#[test]
+fn pop_copy_result_tiles_for_walkers() {
+    // The copy-path pop result must account for the whole operand footprint
+    // (base extension over the spent operand, Set/Push convention), or
+    // positional walkers stepping ACROSS it land on the tombstoned operand
+    // slot. f(l) = [9, pop(l, 1)] — no take, so the pop copies, and the List's
+    // walk must cross the pop result to reach Int(9) below it; with a short
+    // extent the step lands on the Moved slot instead.
+    // get(get(f([1,2,3]), 1), 1) == 2.
+    let tape = run(
+        vec![
+            Sized(FnStart, 4),                           // 0  f
+            Int(9),                                      // 1
+            Var { elem: 0 },                             // 2  pop1(l), observed -> copy
+            Sized(Pop { elems: 1 }, 0),                  // 3
+            Sized(List { elems: 2 }, 0),                 // 4
+            Sized(FnEnd { args: 1 }, 4),                 // 5
+            Ref { offset: 1 },                           // 6  -> f
+            Int(1),                                      // 7
+            Int(2),                                      // 8
+            Int(3),                                      // 9
+            Sized(List { elems: 3 }, 0),                 // 10
+            Sized(Call { args: 1, comptime: false }, 0), // 11
+            Int(1),                                      // 12
+            Sized(Get, 0),                               // 13
+            Int(1),                                      // 14
+            Sized(Get, 0),                               // 15
+        ],
+        false,
+    );
+    assert_eq!(tape.last(), Some(&Int(2)));
 }
 
 #[test]

@@ -571,15 +571,22 @@ impl Vm {
                 }
                 let slots_popped = self.sum_size(sp_list - 1, n)?;
                 let sp_rest_last = sp_list - 1 - slots_popped;
-                let base = if sp_list == sp_op { sp_list - slots_old } else { sp_op };
-                self.push_borrows(sp_rest_last, elems - n, sp_list == sp_op)?;
-                self.push(Sized(List { elems: elems - n }, elems - n));
-                if elems > n {
-                    self.push(Ref { offset: 1 });
+
+                if sp_list == sp_op {
+                    self.stack.truncate(sp_rest_last + 1);
+                    self.push(Sized(List { elems: elems - n }, slots_old - slots_popped));
+                } else if sp_op - sp_list <= elems && self.is_unique_until(sp_list..sp_op) {
+                    for sp in sp_list - n + 1..=sp_list {
+                        self.stack[sp].op = Moved;
+                    }
+                    self.stack[sp_list - n].op =
+                        Sized(List { elems: elems - n }, slots_old - slots_popped);
+                    self.stack[sp_op].op = Ref { offset: sp_op - (sp_list - n) };
+                } else {
+                    self.push_borrows(sp_rest_last, elems - n, false)?;
+                    self.push(Sized(List { elems: elems - n }, self.stack.len() - sp_op));
+                    self.stack[sp_op].op = Moved;
                 }
-                self.push_borrows(sp_list - 1, n, sp_list == sp_op)?;
-                self.push(Sized(List { elems: n + 1 }, self.stack.len() - base));
-                self.stack[sp_op].op = Moved;
                 self.ip += 1;
             }
             Sized(op @ Set, _) if comptime && self.defer(op)? => {}
