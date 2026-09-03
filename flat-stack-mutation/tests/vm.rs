@@ -1364,3 +1364,104 @@ fn call_with_taken_arg_defers() {
     );
     assert_eq!(reload_and_call(stage1, &[9]).last(), Some(&Int(18)));
 }
+
+// --- comptime == runtime ---------------------------------------------------------
+// The stages share one evaluator. Junk that the runtime stack tolerates (tombstones,
+// spent operands, adopted frame regions) may therefore end up inside a residual
+// value, and the next stage re-executes that value slot by slot. These tests pin
+// that such junk is inert on re-execution and that the runtime-only machinery
+// (tail-call collapse, in-place mutation) behaves the same under `comptime`.
+
+#[test]
+fn junk_inside_a_residual_value_is_inert() {
+    // f(x) = get(push([1], 2), x) with x unresolved: the Push runs concretely
+    // inside the deferred body and takes the copy path, which tombstones the
+    // consumed header with Moved inside the new list's extent. The Get then
+    // defers and its span adopts that junk. Re-executing the residual must
+    // rebuild the list correctly: a Moved instruction pushes an inert slot and
+    // the List instruction takes exactly `elems` values from the top.
+    let mut prog = g();
+    prog.extend([
+        Sized(FnStart, 8),                          // 3  f
+        Ref { offset: 2 },                          // 4  -> g
+        Sized(Call { args: 0, comptime: true }, 0), // 5
+        Int(1),                                     // 6
+        Sized(List { elems: 1 }, 0),                // 7  [1]
+        Int(2),                                     // 8
+        Sized(Push { elems: 1 }, 0),                // 9  concrete, copy path
+        Var { elem: 0 },                            // 10 x
+        Sized(Get, 0),                              // 11 defers
+        Sized(FnEnd { args: 1 }, 8),                // 12
+    ]);
+    let stage1 = run(prog, true);
+    assert!(
+        stage1.iter().any(|op| matches!(op, Moved)),
+        "expected the copy path's tombstone inside the residual, got {stage1:?}"
+    );
+    assert_eq!(reload_and_call(stage1, &[1]).last(), Some(&Int(2)));
+}
+
+#[test]
+fn adopted_frame_junk_in_a_residual_reloads() {
+    // h = fn() push([1, 2, 3, 4], 5): the physical copy path leaves a value
+    // whose extent dwarfs the frame's junk (one callee ref), so FnEnd's adopt
+    // arm fires and the returned list swallows the callee ref as junk. Called
+    // at comptime inside f(x) = get(h!(), x), that value lands in the Get span.
+    // The junk ref keeps its target alive through the boundary compaction and
+    // executes as a harmless ref push on reload.
+    let prog = vec![
+        Sized(FnStart, 7),                          // 0  h
+        Int(1),                                     // 1
+        Int(2),                                     // 2
+        Int(3),                                     // 3
+        Int(4),                                     // 4
+        Sized(List { elems: 4 }, 0),                // 5
+        Int(5),                                     // 6
+        Sized(Push { elems: 1 }, 0),                // 7
+        Sized(FnEnd { args: 0 }, 7),                // 8
+        Sized(FnStart, 4),                          // 9  f
+        Ref { offset: 2 },                          // 10 -> h
+        Sized(Call { args: 0, comptime: true }, 0), // 11
+        Var { elem: 0 },                            // 12 x
+        Sized(Get, 0),                              // 13 defers
+        Sized(FnEnd { args: 1 }, 4),                // 14
+    ];
+    let stage1 = run(prog, true);
+    assert_eq!(reload_and_call(stage1.clone(), &[4]).last(), Some(&Int(5)));
+    assert_eq!(reload_and_call(stage1, &[0]).last(), Some(&Int(1)));
+}
+
+#[test]
+fn comptime_tail_calls_collapse_frames() {
+    // countdown(10_000) with the outer call comptime: the recursion runs
+    // concretely under `comptime`, and the closure-arm tail path must collapse
+    // frames exactly as at runtime. Without it the frames vec peaks at 2^15.
+    let mut prog = countdown(10_000);
+    let call = prog.len() - 1;
+    prog[call] = Sized(Call { args: 1, comptime: true }, 0);
+    let mut vm = Vm::load(prog);
+    vm.run(true).expect("comptime countdown(10_000)");
+    assert_eq!(vm.stack.last().map(|slot| slot.op), Some(Int(0)));
+    assert!(vm.frames.capacity() < 64, "frames peaked at {}", vm.frames.capacity());
+    assert!(vm.stack.capacity() < 4096, "stack peaked at {}", vm.stack.capacity());
+}
+
+#[test]
+fn comptime_map_mutates_in_place_like_runtime() {
+    // The stage-4 milestone program, applied at comptime: the same increment
+    // map over 2000 elements must mutate in place under `comptime` too, so the
+    // watermark matches the runtime test (one doubling with the pad) and the
+    // resulting value agrees with the runtime run.
+    let n = 2000;
+    let l: Vec<i64> = vec![0; n];
+    let mut prog = increment_map(1000, &l, &[]);
+    let call = prog.len() - 1;
+    prog[call] = Sized(Call { args: 2, comptime: true }, 0);
+    prog.extend([Int(1500), Sized(Get, 0)]);
+    let mut vm = Vm::load(prog);
+    vm.run(true).expect("comptime map(2000)");
+    assert_eq!(vm.stack.last().map(|slot| slot.op), Some(Int(1)));
+    assert!(vm.stack.capacity() < 8000, "stack peaked at {}", vm.stack.capacity());
+    let runtime = run(increment_map(1000, &l, &[Int(1500), Sized(Get, 0)]), false);
+    assert_eq!(runtime.last(), vm.stack.last().map(|slot| &slot.op));
+}
