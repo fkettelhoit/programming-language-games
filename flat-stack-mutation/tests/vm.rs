@@ -890,6 +890,104 @@ fn map_over_taken_list_runs_in_place() {
     assert!(vm.stack.capacity() < 8000, "stack peaked at {}", vm.stack.capacity());
 }
 
+/// swap-reverse as a self-capturing closure over `l`, then `tail`:
+///   rev(self, l, i, j) = if i < j { rev(self, swap(l, i, j), i+1, j-1) } else { l }
+/// where swap goes through the moves-last helper (the second write's element
+/// is read before any move, so it routes through a call whose parameter order
+/// puts the moved list last):
+///   swap_(a, j, l2) = set(take l2, j, a)
+///   swap(l, i, j)   = swap_(get(l, i), j, set(take l, i, get(l, j)))
+/// Both sets run in place through the walk: the inner take tombstones rev's
+/// binding, the outer take tombstones the helper's, and every other slot
+/// between the list and the operands is an Int or a tape ref.
+fn swap_reverse(pad: usize, l: &[i64], tail: &[Op]) -> Vec<Op> {
+    let mut prog = vec![];
+    if pad > 0 {
+        prog.push(Sized(BlobStart, pad));
+        prog.extend(std::iter::repeat(Int(0)).take(pad));
+        prog.push(Sized(BlobEnd, pad));
+    }
+    prog.extend([
+        Sized(FnStart, 4),                           // +0  swap_ = fn(a, j, l2)
+        Take { elem: 2 },                            // +1  set(take l2, j, a)
+        Var { elem: 0 },                             // +2
+        Var { elem: 1 },                             // +3
+        Sized(Set, 0),                               // +4
+        Sized(FnEnd { args: 3 }, 4),                 // +5
+        Sized(FnStart, 31),                          // +6  rev = fn(self, l, i, j)
+        Sized(FnStart, 22),                          // +7  then: recurse with swap
+        Var { elem: 0 },                             // +8  callee [self, self]
+        Var { elem: 0 },                             // +9
+        Sized(List { elems: 2 }, 0),                 // +10
+        Ref { offset: 6 },                           // +11 -> swap_
+        Var { elem: 1 },                             // +12 a = get(l, i)
+        Var { elem: 2 },                             // +13
+        Sized(Get, 0),                               // +14
+        Var { elem: 3 },                             // +15 j
+        Take { elem: 1 },                            // +16 set(take l, i, get(l, j))
+        Var { elem: 1 },                             // +17
+        Var { elem: 3 },                             // +18
+        Sized(Get, 0),                               // +19
+        Var { elem: 2 },                             // +20
+        Sized(Set, 0),                               // +21
+        Sized(Call { args: 3, comptime: false }, 0), // +22 swap_(a, j, ...)
+        Var { elem: 2 },                             // +23 i + 1
+        Int(1),                                      // +24
+        Sized(Bin(BinOp::Add), 0),                   // +25
+        Var { elem: 3 },                             // +26 j - 1
+        Int(1),                                      // +27
+        Sized(Bin(BinOp::Sub), 0),                   // +28
+        Sized(Call { args: 3, comptime: false }, 0), // +29 tail call
+        Sized(FnEnd { args: 0 }, 22),                // +30
+        Sized(FnStart, 1),                           // +31 else: l
+        Var { elem: 1 },                             // +32
+        Sized(FnEnd { args: 0 }, 1),                 // +33
+        Var { elem: 2 },                             // +34 cond: i < j
+        Var { elem: 3 },                             // +35
+        Sized(Bin(BinOp::Lt), 0),                    // +36
+        Sized(If, 0),                                // +37
+        Sized(FnEnd { args: 4 }, 31),                // +38
+        Ref { offset: 1 },                           // +39
+        Ref { offset: 2 },                           // +40
+        Sized(List { elems: 2 }, 0),                 // +41 c = [rev, rev]
+    ]);
+    for &x in l {
+        prog.push(Int(x));
+    }
+    prog.push(Sized(List { elems: l.len() }, 0));
+    prog.push(Int(0));
+    prog.push(Int(l.len() as i64 - 1));
+    prog.push(Sized(Call { args: 3, comptime: false }, 0));
+    prog.extend_from_slice(tail);
+    prog
+}
+
+#[test]
+fn swap_reverse_reverses_odd_and_even_lengths() {
+    // Small lists fail the walk's distance gate, so these exercise the copy
+    // path end to end; the Lt termination must handle both parities of the
+    // converging index gap.
+    let tape = run(swap_reverse(0, &[10, 20, 30], &[Int(0), Sized(Get, 0)]), false);
+    assert_eq!(tape.last(), Some(&Int(30)));
+    let tape = run(swap_reverse(0, &[1, 2, 3, 4], &[Int(1), Sized(Get, 0)]), false);
+    assert_eq!(tape.last(), Some(&Int(3)));
+}
+
+#[test]
+fn swap_reverse_runs_in_place() {
+    // The second stage-4 milestone: true in-place reversal — n/2 swaps, each
+    // two in-place sets, the list never moving from below the loop's floor.
+    // Same watermark scheme as the map milestone: in-place stays at one
+    // capacity doubling, the copy path (two full copies per swap) blows past
+    // the next.
+    let n: i64 = 2000;
+    let l: Vec<i64> = (0..n).collect();
+    let mut vm = Vm::load(swap_reverse(1000, &l, &[Int(0), Sized(Get, 0)]));
+    vm.run(false).expect("swap_reverse(2000)");
+    assert_eq!(vm.stack.last().map(|slot| slot.op), Some(Int(n - 1)));
+    assert!(vm.stack.capacity() < 8000, "stack peaked at {}", vm.stack.capacity());
+}
+
 #[test]
 fn push_with_live_observer_preserves_the_original() {
     // f(l) = [push(l, 9), get(get(l, 0), 0)] with l = [[7, 8]] — the push
@@ -1346,6 +1444,64 @@ fn call_with_taken_arg_defers() {
         "expected a residual call span, got {stage1:?}"
     );
     assert_eq!(reload_and_call(stage1, &[9]).last(), Some(&Int(18)));
+}
+
+// --- drain-push loops -----------------------------------------------------------
+// The goal programs. rev keeps the accumulator BEFORE the input so that, after
+// each tail-call discharge, the shrinking input sits above the growing
+// accumulator. Reads of l precede both takes; Push activates acc, Pop activates l.
+
+/// rev(self, acc, l) = if len(l) == 0 { acc }
+///                     else { rev([self, self], push(take acc, get(l, len(l) - 1)), pop(take l, 1)) }
+fn reverse(l: &[i64], tail: &[Op]) -> Vec<Op> {
+    let mut prog = vec![
+        Sized(FnStart, 24),                          // 0  fn(self, acc, l)
+        Sized(FnStart, 1),                           // 1  then: acc
+        Var { elem: 1 },                             // 2
+        Sized(FnEnd { args: 0 }, 1),                 // 3
+        Sized(FnStart, 14),                          // 4  else
+        Var { elem: 0 },                             // 5  [self, self]
+        Var { elem: 0 },                             // 6
+        Sized(List { elems: 2 }, 0),                 // 7
+        Take { elem: 1 },                            // 8  acc, reserved
+        Var { elem: 2 },                             // 9  l, Get operand
+        Var { elem: 2 },                             // 10 l, Len operand
+        Sized(Len, 0),                               // 11
+        Int(1),                                      // 12
+        Sized(Bin(BinOp::Sub), 0),                   // 13
+        Sized(Get, 0),                               // 14 x = get(l, len(l) - 1)
+        Sized(Push { elems: 1 }, 0),                 // 15 activates acc
+        Take { elem: 2 },                            // 16 l, reserved
+        Sized(Pop { elems: 1 }, 0),                  // 17 activates l
+        Sized(Call { args: 2, comptime: false }, 0), // 18 tail
+        Sized(FnEnd { args: 0 }, 14),                // 19
+        Var { elem: 2 },                             // 20 cond: len(l) == 0
+        Sized(Len, 0),                               // 21
+        Int(0),                                      // 22
+        Sized(Bin(BinOp::Eq), 0),                    // 23
+        Sized(If, 0),                                // 24
+        Sized(FnEnd { args: 3 }, 24),                // 25
+        Ref { offset: 1 },                           // 26
+        Ref { offset: 2 },                           // 27
+        Sized(List { elems: 2 }, 0),                 // 28 closure
+        Sized(List { elems: 0 }, 0),                 // 29 acc = []
+    ];
+    prog.extend(l.iter().map(|&x| Int(x)));
+    prog.push(Sized(List { elems: l.len() }, 0));
+    prog.push(Sized(Call { args: 2, comptime: false }, 0));
+    prog.extend_from_slice(tail);
+    prog
+}
+
+#[test]
+fn reverse_of_five_elements_is_reversed() {
+    // Value only: rev([1..5]) == [5, 4, 3, 2, 1]. Passes through the copy paths
+    // today; the in-place watermark and timing assertions arrive with the
+    // displace stage.
+    let l: Vec<i64> = (1..=5).collect();
+    assert_eq!(run(reverse(&l, &[Int(0), Sized(Get, 0)]), false).last(), Some(&Int(5)));
+    assert_eq!(run(reverse(&l, &[Int(4), Sized(Get, 0)]), false).last(), Some(&Int(1)));
+    assert_eq!(run(reverse(&l, &[Sized(Len, 0)]), false).last(), Some(&Int(5)));
 }
 
 // --- comptime == runtime ---------------------------------------------------------
