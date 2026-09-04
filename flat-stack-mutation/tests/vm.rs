@@ -1513,24 +1513,26 @@ fn reverse_of_five_elements_is_reversed() {
 
 #[test]
 fn junk_inside_a_residual_value_is_inert() {
-    // f(x) = get(push([1], 2), x) with x unresolved: the Push runs concretely
-    // inside the deferred body and takes the copy path, which tombstones the
-    // consumed header with Moved inside the new list's extent. The Get then
-    // defers and its span adopts that junk. Re-executing the residual must
-    // rebuild the list correctly: a Moved instruction pushes an inert slot and
-    // the List instruction takes exactly `elems` values from the top.
+    // f(x) = get(push(L, 2), x) with x unresolved and L a list literal in the
+    // tape, referenced from the body. The program's own Ref instruction
+    // observes L, so the Push takes the copy path inside the deferred body and
+    // tombstones its consumed operand with Moved inside the new list's extent.
+    // The Get then defers and its span adopts that junk. Re-executing the
+    // residual must rebuild the list correctly: a Moved instruction pushes an
+    // inert slot and the List instruction takes exactly `elems` values.
     let mut prog = g();
     prog.extend([
-        Sized(FnStart, 8),                          // 3  f
-        Ref { offset: 2 },                          // 4  -> g
-        Sized(Call { args: 0, comptime: true }, 0), // 5
-        Int(1),                                     // 6
-        Sized(List { elems: 1 }, 0),                // 7  [1]
-        Int(2),                                     // 8
-        Sized(Push { elems: 1 }, 0),                // 9  concrete, copy path
-        Var { elem: 0 },                            // 10 x
-        Sized(Get, 0),                              // 11 defers
-        Sized(FnEnd { args: 1 }, 8),                // 12
+        Int(1),                                     // 3  L = [1]
+        Sized(List { elems: 1 }, 0),                // 4
+        Sized(FnStart, 7),                          // 5  f
+        Ref { offset: 4 },                          // 6  -> g
+        Sized(Call { args: 0, comptime: true }, 0), // 7
+        Ref { offset: 4 },                          // 8  -> L, observed
+        Int(2),                                     // 9
+        Sized(Push { elems: 1 }, 0),                // 10 concrete, copy path
+        Var { elem: 0 },                            // 11 x
+        Sized(Get, 0),                              // 12 defers
+        Sized(FnEnd { args: 1 }, 7),                // 13
     ]);
     let stage1 = run(prog, true);
     assert!(

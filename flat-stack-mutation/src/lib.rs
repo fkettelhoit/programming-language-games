@@ -256,6 +256,28 @@ impl Vm {
         Ok(())
     }
 
+    fn grow(&mut self, from: usize, by: usize) {
+        let len = self.stack.len();
+        self.stack.resize(len + by, Moved.into());
+        for sp in (from..len).rev() {
+            let mut slot = self.stack[sp];
+            if let Ref { offset } = &mut slot.op
+                && sp - *offset < from
+            {
+                *offset += by
+            }
+            self.stack[sp + by] = slot;
+        }
+        for f in &mut self.frames {
+            f.floor += if f.floor >= from { by } else { 0 };
+            f.base += if f.base >= from { by } else { 0 };
+            if let Some(ret) = &mut f.ret {
+                *ret += if *ret >= from { by } else { 0 };
+            }
+        }
+        self.ip += if self.ip >= from { by } else { 0 };
+    }
+
     fn pop_tail_frames(&mut self) -> Result<CallFrame, &'static str> {
         let mut f = self.frames.pop().ok_or(ERR_NO_CALL_FRAME)?;
         while let Some(r) = f.ret {
@@ -272,7 +294,7 @@ impl Vm {
         Ok(f)
     }
 
-    fn is_unique_until(&self, range: Range<usize>) -> bool {
+    fn is_unique(&self, range: Range<usize>) -> bool {
         let floor = range.start;
         for sp in range.rev() {
             if let Ref { offset } = self.stack[sp].op {
@@ -305,6 +327,14 @@ impl Vm {
             sp = sp.checked_sub(self.stack[sp].size()).ok_or(ERR_UNDERFLOW)?;
         }
         Ok(())
+    }
+
+    fn is_fwd_ref(&self, sp_op: usize, top: usize) -> bool {
+        match self.stack[sp_op].op {
+            Ref { offset } => sp_op - offset >= top,
+            Sized(_, _) => true,
+            _ => false,
+        }
     }
 
     fn has_comptime(&self, slots: usize) -> Result<bool, &'static str> {
@@ -551,11 +581,26 @@ impl Vm {
                 let Sized(List { elems }, slots_old) = self.op(sp_list)? else {
                     return Err(ERR_INVALID_LIST);
                 };
-                self.push_borrows(sp_list - 1, elems, sp_list == sp_op)?;
-                self.push_borrows(sp, n as usize, true)?;
-                let base = if sp_list == sp_op { sp_list - slots_old } else { sp_op };
-                self.push(Sized(List { elems: elems + n as usize }, self.stack.len() - base));
-                self.stack[sp_op].op = Moved;
+                let mutable = slots_tail == n
+                    && (sp_op + 1..=sp).all(|s| !self.is_fwd_ref(s, sp_list))
+                    && (sp_list == sp_op
+                        || sp_op - sp_list <= elems && self.is_unique(sp_list..sp_op));
+                if mutable {
+                    let shift = if sp_list == sp_op { 0 } else { n };
+                    self.grow(sp_list, shift);
+                    for i in 0..n {
+                        self.stack[sp_list + i] =
+                            self.borrow(sp_op + shift + i + 1, sp_list + i)?.into();
+                    }
+                    self.stack[sp_list + n].op = Sized(List { elems: elems + n }, slots_old + n);
+                    self.stack.truncate(sp_op + n + 1);
+                } else {
+                    self.push_borrows(sp_list - 1, elems, sp_list == sp_op)?;
+                    self.push_borrows(sp, n as usize, true)?;
+                    let base = if sp_list == sp_op { sp_list - slots_old } else { sp_op };
+                    self.push(Sized(List { elems: elems + n as usize }, self.stack.len() - base));
+                    self.stack[sp_op].op = Moved;
+                }
                 self.ip += 1;
             }
             Sized(op @ Pop { .. }, _) if comptime && self.defer(op)? => {}
@@ -575,7 +620,7 @@ impl Vm {
                 if sp_list == sp_op {
                     self.stack.truncate(sp_rest_last + 1);
                     self.push(Sized(List { elems: elems - n }, slots_old - slots_popped));
-                } else if sp_op - sp_list <= elems && self.is_unique_until(sp_list..sp_op) {
+                } else if sp_op - sp_list <= elems && self.is_unique(sp_list..sp_op) {
                     for sp in sp_list - n + 1..=sp_list {
                         self.stack[sp].op = Moved;
                     }
@@ -606,14 +651,9 @@ impl Vm {
                     return Err(ERR_INDEX_OUT_OF_BOUNDS);
                 }
                 let sp_i = sp_list - elems + i as usize;
-                let is_forward_ref = match self.op(sp_elem)? {
-                    Ref { offset } => sp_elem - offset >= sp_i,
-                    Sized(_, _) => true,
-                    _ => false,
-                };
                 if sp_op - sp_list <= elems
-                    && self.is_unique_until(sp_list..sp_op)
-                    && !is_forward_ref
+                    && self.is_unique(sp_list..sp_op)
+                    && !self.is_fwd_ref(sp_elem, sp_i)
                 {
                     self.stack[sp_i] = self.borrow(sp_elem, sp_i)?.into();
                     self.stack.truncate(sp_op + 1);
