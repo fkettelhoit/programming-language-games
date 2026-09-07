@@ -224,6 +224,16 @@ impl Vm {
         Ok(gap)
     }
 
+    fn gc_block(&mut self, block: Range<usize>, track: usize) -> Result<usize, &'static str> {
+        for sp in block.end..=self.sp() {
+            self.stack[sp].meta.mark = true;
+        }
+        let gap = self.mark_and_compact(block.start, self.sp())?;
+        let track = if track >= block.start { track - self.stack[track].meta.shift } else { track };
+        self.stack.truncate(self.stack.len() - gap);
+        Ok(track)
+    }
+
     fn gc_until(&mut self, floor: usize) -> Result<(), &'static str> {
         // resolve the return value first
         let Some(top) = self.stack.len().checked_sub(1) else { return Ok(()) };
@@ -246,22 +256,30 @@ impl Vm {
         Ok(())
     }
 
-    fn drop_junk(&mut self, block: Range<usize>) -> Result<usize, &'static str> {
+    fn live_prefix(&self, block: Range<usize>) -> Result<(usize, usize), &'static str> {
         let mut sp = self.sp();
-        let mut keep = block.start;
+        let mut max_live = block.start;
+        let mut sum_live = 0;
         while sp >= block.end {
             match self.op(sp)? {
-                Ref { offset } if sp - offset < block.end => keep = max(keep, sp - offset + 1),
+                Ref { offset } if block.contains(&(sp - offset)) => {
+                    max_live = max(max_live, sp - offset + 1);
+                    sum_live += self.stack.get(sp - offset).ok_or(ERR_INVALID_REF)?.size();
+                }
                 Sized(BlobEnd, slots) => sp -= slots,
                 _ => {}
             }
             sp = sp.checked_sub(1).ok_or(ERR_UNDERFLOW)?;
         }
+        Ok((max_live, sum_live))
+    }
+
+    fn slide_block(&mut self, block: Range<usize>, keep: usize) -> Result<usize, &'static str> {
         let shift = block.end - keep;
         if shift == 0 {
             return Ok(0);
         }
-        sp = self.sp();
+        let mut sp = self.sp();
         while sp >= block.end {
             match &mut self.stack.get_mut(sp).ok_or(ERR_UNDERFLOW)?.op {
                 Ref { offset } if sp - *offset < block.end => *offset -= shift,
@@ -272,6 +290,16 @@ impl Vm {
         }
         self.stack.drain(keep..block.end);
         Ok(shift)
+    }
+
+    fn gc_tail(&mut self, from: usize, to: usize, track: usize) -> Result<usize, &'static str> {
+        let (max_live, sum_live) = self.live_prefix(from..to)?;
+        if max_live - from > 2 * sum_live {
+            self.gc_block(from..to, track)
+        } else {
+            let shift = self.slide_block(from..to, max_live)?;
+            Ok(if track >= to { track - shift } else { track })
+        }
     }
 
     fn grow(&mut self, from: usize, by: usize) {
@@ -506,8 +534,7 @@ impl Vm {
                             (Sized(FnEnd { .. }, _), Some(frame)) if !frame.is_deferred => {
                                 let frame = self.pop_tail_frames()?;
                                 let call_start = sp_op - slots_op + 1;
-                                let shift = self.drop_junk(frame.floor..call_start)?;
-                                let sp_f = if sp_f >= call_start { sp_f - shift } else { sp_f };
+                                let sp_f = self.gc_tail(frame.floor, call_start, sp_f)?;
                                 (sp_f, CallFrame { base: self.stack.len() - args, args, ..frame })
                             }
                             _ => {
@@ -522,7 +549,7 @@ impl Vm {
                     }
                     (Sized(List { elems }, _), _) if elems > 0 => {
                         // closure = [FnEnd, <arg0>, <arg1>, ...]
-                        let mut sp_code = self.resolve_slot(sp_f - elems)?;
+                        let sp_code = self.resolve_slot(sp_f - elems)?;
                         match self.op(sp_code)? {
                             Sized(FnEnd { args: a }, _) if elems - 1 + args != a => {
                                 return Err(ERR_INVALID_ARITY);
@@ -538,9 +565,8 @@ impl Vm {
                                         {
                                             let frame = self.pop_tail_frames()?;
                                             let call_start = sp_op - slots_op + 1;
-                                            let shift = self.drop_junk(frame.floor..call_start)?;
-                                            sp_code -=
-                                                if sp_code >= call_start { shift } else { 0 };
+                                            let sp_code =
+                                                self.gc_tail(frame.floor, call_start, sp_code)?;
                                             let frame = CallFrame {
                                                 base: self.stack.len() - arity,
                                                 args: arity,
