@@ -1254,6 +1254,39 @@ fn returning_a_taken_list_moves_it_out() {
 }
 
 #[test]
+fn returning_a_taken_list_of_lists_keeps_its_element_refs() {
+    // f(l) = take l with l = [[1], [2], [3]]: the return value is a ref to a
+    // list above the floor, so FnEnd compacts through gc_until, and the only
+    // dead slot below the list is the callee ref at the floor. Every element
+    // ref sits several slots above its target, so pass 2 has to leave each
+    // target's recorded shift in place until the refs above it have been
+    // rebased; moving a higher slot must not reset the meta of the lower slot
+    // it lands on. get(get(f(l), 0), 0) == 1.
+    let tape = run(
+        vec![
+            Sized(FnStart, 1),                           // 0  f
+            Take { elem: 0 },                            // 1
+            Sized(FnEnd { args: 1 }, 1),                 // 2
+            Ref { offset: 1 },                           // 3  -> f
+            Int(1),                                      // 4
+            Sized(List { elems: 1 }, 0),                 // 5
+            Int(2),                                      // 6
+            Sized(List { elems: 1 }, 0),                 // 7
+            Int(3),                                      // 8
+            Sized(List { elems: 1 }, 0),                 // 9
+            Sized(List { elems: 3 }, 0),                 // 10 l = [[1], [2], [3]]
+            Sized(Call { args: 1, comptime: false }, 0), // 11
+            Int(0),                                      // 12
+            Sized(Get, 0),                               // 13
+            Int(0),                                      // 14
+            Sized(Get, 0),                               // 15
+        ],
+        false,
+    );
+    assert_eq!(tape.last(), Some(&Int(1)));
+}
+
+#[test]
 fn push_of_element_derived_from_taken_list() {
     // f(l) = push(take l, get(l, 0) + get(l, 1)) — the fib/prefix-sum shape:
     // the pushed element derives from the very list being moved. Two-phase
@@ -1502,6 +1535,256 @@ fn reverse_of_five_elements_is_reversed() {
     assert_eq!(run(reverse(&l, &[Int(0), Sized(Get, 0)]), false).last(), Some(&Int(5)));
     assert_eq!(run(reverse(&l, &[Int(4), Sized(Get, 0)]), false).last(), Some(&Int(1)));
     assert_eq!(run(reverse(&l, &[Sized(Len, 0)]), false).last(), Some(&Int(5)));
+}
+
+// --- linear time ----------------------------------------------------------------
+// The guarantee: a loop written the obvious way over an owned list costs O(1)
+// per element. Wall-clock is noisy, so these tests use the VM's work counter
+// (slot reads plus writes) and compare two sizes: linear work grows by the
+// size ratio, quadratic work by its square. Every program here is entered by
+// a direct tail call from the frame that holds the list, with no starter.
+
+fn work(prog: Vec<Op>) -> usize {
+    let mut vm = Vm::load(prog);
+    vm.run(false).expect("linear-time program");
+    vm.stats.reads + vm.stats.writes
+}
+
+/// The loop body of a starter-style builder: everything up to and including
+/// the loop function's own FnEnd (the first one with the given arity).
+fn loop_body(prog: Vec<Op>, loop_args: usize) -> Vec<Op> {
+    let end = prog
+        .iter()
+        .position(|op| matches!(op, Sized(FnEnd { args }, _) if *args == loop_args))
+        .expect("loop FnEnd");
+    prog[..=end].to_vec()
+}
+
+/// increment_map entered directly: map([map, map], l, 0), then `tail`.
+fn increment_map_naive(l: &[i64], tail: &[Op]) -> Vec<Op> {
+    let mut prog = loop_body(increment_map(0, l, &[]), 3);
+    prog.extend([Ref { offset: 1 }, Ref { offset: 2 }, Sized(List { elems: 2 }, 0)]);
+    prog.extend(l.iter().map(|&x| Int(x)));
+    prog.push(Sized(List { elems: l.len() }, 0));
+    prog.push(Int(0));
+    prog.push(Sized(Call { args: 2, comptime: false }, 0));
+    prog.extend_from_slice(tail);
+    prog
+}
+
+/// swap_reverse entered directly: rev([rev, rev], l, 0, len - 1), then `tail`.
+fn swap_reverse_naive(l: &[i64], tail: &[Op]) -> Vec<Op> {
+    let mut prog = loop_body(swap_reverse(0, l, &[]), 4);
+    prog.extend([Ref { offset: 1 }, Ref { offset: 2 }, Sized(List { elems: 2 }, 0)]);
+    prog.extend(l.iter().map(|&x| Int(x)));
+    prog.push(Sized(List { elems: l.len() }, 0));
+    prog.push(Int(0));
+    prog.push(Int(l.len() as i64 - 1));
+    prog.push(Sized(Call { args: 3, comptime: false }, 0));
+    prog.extend_from_slice(tail);
+    prog
+}
+
+/// list_accumulator with the list moved into each push: loop(push(take l, i), i - 1).
+fn take_accumulator(n: i64, tail: &[Op]) -> Vec<Op> {
+    let mut prog = list_accumulator(n, tail);
+    prog[8] = Take { elem: 1 };
+    prog
+}
+
+/// copying map over a shared input: the input is read by index and never
+/// mutated, the output is a fresh accumulator built by push.
+///   cmap(self, l, acc, i) = if i == len(l) { acc }
+///                           else { cmap(self, l, push(take acc, get(l, i) + 1), i + 1) }
+/// Both lists are live in the frame region for the whole loop, so the
+/// discharge has two referenced heads to keep; this is the program that
+/// separates the summed live estimate from a single-head one.
+fn copying_map(l: &[i64], tail: &[Op]) -> Vec<Op> {
+    let mut prog = vec![
+        Sized(FnStart, 25),                          // 0  fn(self, l, acc, i)
+        Sized(FnStart, 1),                           // 1  then: acc
+        Var { elem: 2 },                             // 2
+        Sized(FnEnd { args: 0 }, 1),                 // 3
+        Sized(FnStart, 15),                          // 4  else
+        Var { elem: 0 },                             // 5  [self, self]
+        Var { elem: 0 },                             // 6
+        Sized(List { elems: 2 }, 0),                 // 7
+        Var { elem: 1 },                             // 8  l, passed on
+        Take { elem: 2 },                            // 9  acc, reserved
+        Var { elem: 1 },                             // 10 get(l, i) + 1
+        Var { elem: 3 },                             // 11
+        Sized(Get, 0),                               // 12
+        Int(1),                                      // 13
+        Sized(Bin(BinOp::Add), 0),                   // 14
+        Sized(Push { elems: 1 }, 0),                 // 15 activates acc
+        Var { elem: 3 },                             // 16 i + 1
+        Int(1),                                      // 17
+        Sized(Bin(BinOp::Add), 0),                   // 18
+        Sized(Call { args: 3, comptime: false }, 0), // 19 tail
+        Sized(FnEnd { args: 0 }, 15),                // 20
+        Var { elem: 3 },                             // 21 cond: i == len(l)
+        Var { elem: 1 },                             // 22
+        Sized(Len, 0),                               // 23
+        Sized(Bin(BinOp::Eq), 0),                    // 24
+        Sized(If, 0),                                // 25
+        Sized(FnEnd { args: 4 }, 25),                // 26
+        Ref { offset: 1 },                           // 27
+        Ref { offset: 2 },                           // 28
+        Sized(List { elems: 2 }, 0),                 // 29 closure
+    ];
+    prog.extend(l.iter().map(|&x| Int(x)));
+    prog.push(Sized(List { elems: l.len() }, 0));
+    prog.push(Sized(List { elems: 0 }, 0)); // acc = []
+    prog.push(Int(0));
+    prog.push(Sized(Call { args: 3, comptime: false }, 0));
+    prog.extend_from_slice(tail);
+    prog
+}
+
+/// A list of lists copied once on the way into an in-place loop:
+///   f(l) = loop([loop, loop], push(l, [0]), 0)
+///   loop(self, l, i) = if i == len(l) { l } else { loop(self, set(take l, i, get(l, i)), i + 1) }
+/// f's own binding observes l, so the push copies; the copy's elements keep
+/// the original's inner lists alive after f's frame is gone. Those inner lists
+/// then sit below the loop's list without being referenced from any tail-call
+/// block, which is exactly what the summed live estimate cannot see.
+fn copied_list_of_lists_loop(n: usize, tail: &[Op]) -> Vec<Op> {
+    let mut prog = vec![
+        Sized(FnStart, 23),                          // 0  loop = fn(self, l, i)
+        Sized(FnStart, 1),                           // 1  then: l
+        Var { elem: 1 },                             // 2
+        Sized(FnEnd { args: 0 }, 1),                 // 3
+        Sized(FnStart, 13),                          // 4  else
+        Var { elem: 0 },                             // 5  [self, self]
+        Var { elem: 0 },                             // 6
+        Sized(List { elems: 2 }, 0),                 // 7
+        Take { elem: 1 },                            // 8  set(take l, i, get(l, i))
+        Var { elem: 1 },                             // 9
+        Var { elem: 2 },                             // 10
+        Sized(Get, 0),                               // 11
+        Var { elem: 2 },                             // 12
+        Sized(Set, 0),                               // 13
+        Var { elem: 2 },                             // 14 i + 1
+        Int(1),                                      // 15
+        Sized(Bin(BinOp::Add), 0),                   // 16
+        Sized(Call { args: 2, comptime: false }, 0), // 17 tail
+        Sized(FnEnd { args: 0 }, 13),                // 18
+        Var { elem: 2 },                             // 19 cond: i == len(l)
+        Var { elem: 1 },                             // 20
+        Sized(Len, 0),                               // 21
+        Sized(Bin(BinOp::Eq), 0),                    // 22
+        Sized(If, 0),                                // 23
+        Sized(FnEnd { args: 3 }, 23),                // 24
+        Sized(FnStart, 9),                           // 25 f = fn(l)
+        Ref { offset: 2 },                           // 26 -> loop
+        Ref { offset: 3 },                           // 27 -> loop
+        Sized(List { elems: 2 }, 0),                 // 28
+        Var { elem: 0 },                             // 29 l, observed by this binding
+        Int(0),                                      // 30 [0]
+        Sized(List { elems: 1 }, 0),                 // 31
+        Sized(Push { elems: 1 }, 0),                 // 32 copies
+        Int(0),                                      // 33
+        Sized(Call { args: 2, comptime: false }, 0), // 34 tail into the loop
+        Sized(FnEnd { args: 1 }, 9),                 // 35
+        Ref { offset: 1 },                           // 36 -> f
+    ];
+    for i in 0..n {
+        prog.push(Int(i as i64));
+        prog.push(Sized(List { elems: 1 }, 0));
+    }
+    prog.push(Sized(List { elems: n }, 0));
+    prog.push(Sized(Call { args: 1, comptime: false }, 0));
+    prog.extend_from_slice(tail);
+    prog
+}
+
+/// work(4n) / work(n) for a program family; 4 means linear, 16 quadratic.
+fn growth(build: impl Fn(usize) -> Vec<Op>, n: usize) -> f64 {
+    work(build(4 * n)) as f64 / work(build(n)) as f64
+}
+
+#[test]
+fn take_accumulator_is_linear() {
+    assert_eq!(run(take_accumulator(3, &[Int(0), Sized(Get, 0)]), false).last(), Some(&Int(3)));
+    let g = growth(|n| take_accumulator(n as i64, &[Sized(Len, 0)]), 1000);
+    assert!(g < 4.5, "work grew {g:.1}x for 4x the elements");
+}
+
+#[test]
+fn naive_index_map_is_linear() {
+    let l = vec![0; 3000];
+    assert_eq!(
+        run(increment_map_naive(&l, &[Int(2999), Sized(Get, 0)]), false).last(),
+        Some(&Int(1))
+    );
+    let g = growth(|n| increment_map_naive(&vec![0; n], &[Sized(Len, 0)]), 1000);
+    assert!(g < 4.5, "work grew {g:.1}x for 4x the elements");
+}
+
+#[test]
+fn naive_swap_reverse_is_linear() {
+    let l: Vec<i64> = (0..3000).collect();
+    assert_eq!(
+        run(swap_reverse_naive(&l, &[Int(0), Sized(Get, 0)]), false).last(),
+        Some(&Int(2999))
+    );
+    let g =
+        growth(|n| swap_reverse_naive(&(0..n as i64).collect::<Vec<_>>(), &[Sized(Len, 0)]), 1000);
+    assert!(g < 4.5, "work grew {g:.1}x for 4x the elements");
+}
+
+#[test]
+fn copying_map_is_linear() {
+    let l: Vec<i64> = (0..3000).collect();
+    assert_eq!(run(copying_map(&l, &[Int(7), Sized(Get, 0)]), false).last(), Some(&Int(8)));
+    assert_eq!(run(copying_map(&l, &[Sized(Len, 0)]), false).last(), Some(&Int(3000)));
+    let g = growth(|n| copying_map(&(0..n as i64).collect::<Vec<_>>(), &[Sized(Len, 0)]), 1000);
+    assert!(g < 4.5, "work grew {g:.1}x for 4x the elements");
+}
+
+#[test]
+fn starter_entry_costs_the_same_as_the_direct_entry() {
+    // The starter workaround is inert now: same work, same result.
+    let l = vec![0; 2000];
+    let starter = work(increment_map(0, &l, &[Sized(Len, 0)]));
+    let naive = work(increment_map_naive(&l, &[Sized(Len, 0)]));
+    assert!((starter as f64 / naive as f64 - 1.0).abs() < 0.05, "starter {starter}, naive {naive}");
+}
+
+#[test]
+fn observed_accumulator_copies_every_iteration() {
+    // The cost model, pinned: without `take` the frame's binding observes the
+    // list, every push copies, and the loop is quadratic. Copy-on-write is the
+    // semantics; this test guards against an in-place path that ignores an
+    // observer.
+    let g = growth(|n| list_accumulator(n as i64, &[Sized(Len, 0)]), 250);
+    assert!(g > 8.0, "expected quadratic growth, got {g:.1}x for 4x the elements");
+}
+
+#[test]
+fn compaction_refreshes_marks_and_shifts_in_the_unmoved_prefix() {
+    // Two compactions of the same frame region in a row: the first drops the
+    // callee slot at the floor, so every position above it records shift 1 and
+    // keeps a mark. In the second the list sits at the floor with gap 0. Its
+    // slots must still get mark cleared and shift reset to 0, because the refs
+    // above it (past the dead junk, so with gap > 0) rebase against the shift
+    // recorded at their target; a stale 1 there sends every element ref one slot
+    // too high. copied_list_of_lists_loop compacts on every tail call once the
+    // orphaned inner lists outweigh the copy, which at n = 20 is from the first
+    // iteration on. get(get(f(l), 0), 0) == 0.
+    let tape =
+        run(copied_list_of_lists_loop(20, &[Int(0), Sized(Get, 0), Int(0), Sized(Get, 0)]), false);
+    assert_eq!(tape.last(), Some(&Int(0)));
+}
+
+#[test]
+#[ignore = "linear only once the slow path adopts the compacted prefix into the referenced heads"]
+fn copied_list_of_lists_loop_is_linear() {
+    let tape =
+        run(copied_list_of_lists_loop(3, &[Int(0), Sized(Get, 0), Int(0), Sized(Get, 0)]), false);
+    assert_eq!(tape.last(), Some(&Int(0)));
+    let g = growth(|n| copied_list_of_lists_loop(n, &[Sized(Len, 0)]), 250);
+    assert!(g < 4.5, "work grew {g:.1}x for 4x the elements");
 }
 
 // --- comptime == runtime ---------------------------------------------------------
