@@ -84,6 +84,7 @@ pub struct CallFrame {
     pub args: usize,
     pub ret: Option<usize>,
     pub is_deferred: bool,
+    pub last_gc: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -284,22 +285,20 @@ impl Vm {
         Ok(())
     }
 
-    fn live_prefix(&mut self, block: Range<usize>) -> Result<(usize, usize), &'static str> {
+    fn max_live(&mut self, block: Range<usize>) -> Result<usize, &'static str> {
         let mut sp = self.sp();
         let mut max_live = block.start;
-        let mut sum_live = 0;
         while sp >= block.end {
             match self.op(sp)? {
                 Ref { offset } if block.contains(&(sp - offset)) => {
                     max_live = max(max_live, sp - offset + 1);
-                    sum_live += self.op(sp - offset).map_err(|_| ERR_INVALID_REF)?.size();
                 }
                 Sized(BlobEnd, slots) => sp -= slots,
                 _ => {}
             }
             sp = sp.checked_sub(1).ok_or(ERR_UNDERFLOW)?;
         }
-        Ok((max_live, sum_live))
+        Ok(max_live)
     }
 
     fn slide_block(&mut self, block: Range<usize>, keep: usize) -> Result<usize, &'static str> {
@@ -322,13 +321,23 @@ impl Vm {
         Ok(shift)
     }
 
-    fn gc_tail(&mut self, from: usize, to: usize, track: usize) -> Result<usize, &'static str> {
-        let (max_live, sum_live) = self.live_prefix(from..to)?;
-        if max_live - from > 2 * sum_live {
-            self.gc_block(from..to, track)
+    fn gc_tail(
+        &mut self,
+        last_gc: &mut usize,
+        from: usize,
+        to: usize,
+        track: usize,
+    ) -> Result<usize, &'static str> {
+        let max_live = self.max_live(from..to)?;
+        let shift = self.slide_block(from..to, max_live)?;
+        let track = if track >= to { track - shift } else { track };
+        if to - from - shift > 2 * *last_gc {
+            let block_len = self.stack.len() - (to - shift);
+            let track = self.gc_block(from..to - shift, track)?;
+            *last_gc = self.stack.len() - from - block_len;
+            Ok(track)
         } else {
-            let shift = self.slide_block(from..to, max_live)?;
-            Ok(if track >= to { track - shift } else { track })
+            Ok(track)
         }
     }
 
@@ -465,7 +474,7 @@ impl Vm {
         Ok(is_unresolved)
     }
 
-    fn eval_once(&mut self, comptime: bool) -> Result<(), &'static str> {
+    pub fn eval_once(&mut self, comptime: bool) -> Result<(), &'static str> {
         match self.op(self.ip).map_err(|_| ERR_NO_OP)? {
             v @ (Moved | Int(_)) => {
                 self.push(v);
@@ -508,7 +517,15 @@ impl Vm {
                     let base = self.stack.len() - args;
                     (base, base, args)
                 };
-                self.frames.push(CallFrame { floor, base, args, ret: None, is_deferred: true });
+                let last_gc = self.stack.len() - floor;
+                self.frames.push(CallFrame {
+                    floor,
+                    base,
+                    args,
+                    ret: None,
+                    is_deferred: true,
+                    last_gc,
+                });
                 self.ip += 1;
             }
             Sized(FnStart, slots) | Sized(BlobStart, slots) => {
@@ -570,16 +587,22 @@ impl Vm {
                         }
                         let (sp_f, frame) = match (self.op(self.ip + 1)?, self.frames.last()) {
                             (Sized(FnEnd { .. }, _), Some(frame)) if !frame.is_deferred => {
-                                let frame = self.pop_tail_frames()?;
+                                let mut frame = self.pop_tail_frames()?;
                                 let call_start = sp_op - slots_op + 1;
-                                let sp_f = self.gc_tail(frame.floor, call_start, sp_f)?;
+                                let sp_f = self.gc_tail(
+                                    &mut frame.last_gc,
+                                    frame.floor,
+                                    call_start,
+                                    sp_f,
+                                )?;
                                 (sp_f, CallFrame { base: self.stack.len() - args, args, ..frame })
                             }
                             _ => {
                                 let base = self.stack.len() - args;
                                 let floor = sp_op - slots_op + 1;
                                 let is_deferred = false;
-                                (sp_f, CallFrame { floor, base, args, ret, is_deferred })
+                                let last_gc = self.stack.len() - floor;
+                                (sp_f, CallFrame { floor, base, args, ret, is_deferred, last_gc })
                             }
                         };
                         self.frames.push(frame);
@@ -601,10 +624,14 @@ impl Vm {
                                         (Sized(FnEnd { .. }, _), Some(frame))
                                             if !frame.is_deferred =>
                                         {
-                                            let frame = self.pop_tail_frames()?;
+                                            let mut frame = self.pop_tail_frames()?;
                                             let call_start = sp_op - slots_op + 1;
-                                            let sp_code =
-                                                self.gc_tail(frame.floor, call_start, sp_code)?;
+                                            let sp_code = self.gc_tail(
+                                                &mut frame.last_gc,
+                                                frame.floor,
+                                                call_start,
+                                                sp_code,
+                                            )?;
                                             let frame = CallFrame {
                                                 base: self.stack.len() - arity,
                                                 args: arity,
@@ -613,12 +640,15 @@ impl Vm {
                                             (sp_code, frame)
                                         }
                                         _ => {
+                                            let floor = sp_op - slots_op + 1;
+                                            let last_gc = self.stack.len() - floor;
                                             let frame = CallFrame {
-                                                floor: sp_op - slots_op + 1,
+                                                floor,
                                                 base: self.stack.len() - arity,
                                                 args: arity,
                                                 ret,
                                                 is_deferred: false,
+                                                last_gc,
                                             };
                                             (sp_code, frame)
                                         }
@@ -814,10 +844,22 @@ impl Vm {
                         if a != 0 || b != 0 {
                             return Err(ERR_INVALID_ARITY);
                         }
-                        let CallFrame { base, args, is_deferred, .. } =
-                            self.frames.last().copied().ok_or(ERR_NO_CALL_FRAME)?;
+                        let CallFrame {
+                            base,
+                            args,
+                            is_deferred,
+                            last_gc: size_after_compation,
+                            ..
+                        } = self.frames.last().copied().ok_or(ERR_NO_CALL_FRAME)?;
                         let ret = Some(self.ip + 1);
-                        self.frames.push(CallFrame { floor: t, base, args, ret, is_deferred });
+                        self.frames.push(CallFrame {
+                            floor: t,
+                            base,
+                            args,
+                            ret,
+                            is_deferred,
+                            last_gc: size_after_compation,
+                        });
                         self.ip = if cond == 0 { sp_f - slots_f } else { sp_t - slots_t };
                     }
                     (_, _) => return Err(ERR_INVALID_FN),

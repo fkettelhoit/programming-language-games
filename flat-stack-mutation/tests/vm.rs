@@ -1778,8 +1778,13 @@ fn compaction_refreshes_marks_and_shifts_in_the_unmoved_prefix() {
 }
 
 #[test]
-#[ignore = "linear only once the slow path adopts the compacted prefix into the referenced heads"]
 fn copied_list_of_lists_loop_is_linear() {
+    // Parked while the discharge decided by liveness estimate: the orphaned
+    // inner lists sit below the loop's list, referenced from no tail-call
+    // block, which is exactly what a summed live estimate cannot see. Now
+    // that a full compaction is scheduled by region growth instead, they are
+    // collected on a doubling schedule and the loop is linear without the
+    // slow path having to adopt anything.
     let tape =
         run(copied_list_of_lists_loop(3, &[Int(0), Sized(Get, 0), Int(0), Sized(Get, 0)]), false);
     assert_eq!(tape.last(), Some(&Int(0)));
