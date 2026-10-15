@@ -9,3 +9,4 @@ A collection of vaguely research-y experiments involving programming languages. 
 - [Flat stack lists](./flat-stack-lists) - Immutable lists entirely on the stack
 - [Flat stack closures](./flat-stack-closures/) - Closures entirely on the stack
 - [Flat stack comptime](./flat-stack-comptime/) - Comptime output bytecode == runtime input bytecode
+- [Flat stack mutation](./flat-stack-mutation/) - Functional-but-in-place mutation on the stack
